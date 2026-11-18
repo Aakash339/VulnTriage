@@ -1,24 +1,31 @@
 import unittest
+import csv
+import io
+from collections import Counter
 
 from app import (
     SORT_OPTIONS,
     _filter_findings,
     _finding_summary,
+    _prepare_queue,
+    _queue_filter_defaults,
+    _risk_analysis_summary,
     _sort_findings,
 )
+from reports.report_generator import generate_csv_report
 
 
 class DashboardFindingTests(unittest.TestCase):
     def setUp(self):
         self.findings = [
-            {"package": "zeta", "priority": "LOW", "severity": "CRITICAL", "reachability": "USED", "vulnerability_id": "Z-1"},
-            {"package": "Beta", "priority": "CRITICAL", "severity": "HIGH", "reachability": "UNKNOWN", "vulnerability_id": "B-2"},
-            {"package": "alpha", "priority": "CRITICAL", "severity": "CRITICAL", "reachability": "USED", "vulnerability_id": "A-1"},
-            {"package": "alpha", "priority": "UNKNOWN", "severity": "UNKNOWN", "reachability": "NOT_FOUND", "vulnerability_id": "C-1"},
-            {"package": "gamma", "priority": "MEDIUM", "severity": "MEDIUM", "reachability": "NOT_FOUND", "vulnerability_id": "D-1"},
+            {"package": "zeta", "priority": "LOW", "severity": "CRITICAL", "reachability": "USED", "vulnerability_id": "Z-1", "risk_score": 40},
+            {"package": "Beta", "priority": "CRITICAL", "severity": "HIGH", "reachability": "UNKNOWN", "vulnerability_id": "B-2", "risk_score": 90},
+            {"package": "alpha", "priority": "CRITICAL", "severity": "CRITICAL", "reachability": "USED", "vulnerability_id": "A-1", "risk_score": 90},
+            {"package": "alpha", "priority": "UNKNOWN", "severity": "UNKNOWN", "reachability": "NOT_FOUND", "vulnerability_id": "C-1", "risk_score": 10},
+            {"package": "gamma", "priority": "MEDIUM", "severity": "MEDIUM", "reachability": "NOT_FOUND", "vulnerability_id": "D-1", "risk_score": 70},
         ]
 
-    def test_default_priority_then_severity_then_package(self):
+    def test_default_risk_sort_then_priority_and_severity_tiebreakers(self):
         original = list(self.findings)
         sorted_rows = _sort_findings(self.findings)
         self.assertEqual(
@@ -29,6 +36,7 @@ class DashboardFindingTests(unittest.TestCase):
 
     def test_sort_options(self):
         expected = {
+            "Risk score (Highest first)": ["alpha", "Beta", "gamma", "zeta", "alpha"],
             "Priority (Highest first)": ["alpha", "Beta", "gamma", "zeta", "alpha"],
             "Severity (Highest first)": ["alpha", "zeta", "Beta", "gamma", "alpha"],
             "Package name (A–Z)": ["alpha", "alpha", "Beta", "gamma", "zeta"],
@@ -60,6 +68,65 @@ class DashboardFindingTests(unittest.TestCase):
             "used": 2,
             "unknown_reachability": 1,
         })
+
+    def test_36_findings_default_queue_and_empty_filters_show_everything(self):
+        findings = make_reported_sample()
+        queued = _prepare_queue(findings, set(), set(), "All", SORT_OPTIONS[0])
+        self.assertEqual(len(queued), 36)
+        self.assertEqual(Counter(row["severity"] for row in queued), {
+            "HIGH": 10, "MEDIUM": 18, "UNKNOWN": 8,
+        })
+
+    def test_36_finding_filters_apply_independently_and_all_reachability(self):
+        findings = make_reported_sample()
+        high_only = _prepare_queue(findings, {"HIGH"}, set(), "All", SORT_OPTIONS[0])
+        medium_priority_only = _prepare_queue(findings, set(), {"MEDIUM"}, "All", SORT_OPTIONS[0])
+        used_only = _prepare_queue(findings, set(), set(), "USED", SORT_OPTIONS[0])
+        unknown_severity = _prepare_queue(findings, {"UNKNOWN"}, {"UNKNOWN"}, "All", SORT_OPTIONS[0])
+        self.assertEqual(len(high_only), 10)
+        self.assertEqual(len(medium_priority_only), 18)
+        self.assertEqual(len(used_only), 12)
+        self.assertEqual(len(unknown_severity), 8)
+        self.assertEqual(len(_prepare_queue(findings, set(), set(), "All", SORT_OPTIONS[0])), 36)
+
+    def test_reset_defaults_restore_all_36_and_csv_ignores_filters(self):
+        findings = make_reported_sample()
+        defaults = _queue_filter_defaults(findings)
+        restored = _prepare_queue(
+            findings, set(defaults["soc-severity"]), set(defaults["soc-priority"]),
+            defaults["soc-reachability"], defaults["soc-sort"],
+        )
+        filtered = _prepare_queue(findings, {"HIGH"}, set(), "All", SORT_OPTIONS[0])
+        csv_rows = list(csv.reader(io.StringIO(generate_csv_report(findings).decode("utf-8"))))
+        self.assertEqual(len(restored), 36)
+        self.assertEqual(len(filtered), 10)
+        self.assertEqual(len(csv_rows) - 1, 36)
+
+    def test_36_finding_risk_analysis_uses_actual_scores_and_reachability(self):
+        summary = _risk_analysis_summary(make_reported_sample())
+        self.assertEqual(summary["average"], 72.5)
+        self.assertEqual(summary["highest"], 90)
+        self.assertEqual(summary["unknown_severity"], 8)
+        self.assertEqual(summary["reachability"], {"USED": 12, "NOT_FOUND": 12, "UNKNOWN": 12})
+
+
+def make_reported_sample():
+    findings = []
+    distribution = [("HIGH", 10), ("MEDIUM", 18), ("UNKNOWN", 8)]
+    index = 0
+    for severity, count in distribution:
+        for _ in range(count):
+            findings.append({
+                "package": f"sample-package-{index:02d}",
+                "vulnerability_id": f"OSV-2026-{index:04d}",
+                "installed_version": "1.0.0",
+                "severity": severity,
+                "priority": severity,
+                "reachability": ("USED", "NOT_FOUND", "UNKNOWN")[index % 3],
+                "risk_score": 90 - index,
+            })
+            index += 1
+    return findings
 
 
 if __name__ == "__main__":

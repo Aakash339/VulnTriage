@@ -58,6 +58,35 @@ class ReportGeneratorTests(unittest.TestCase):
             "The score reflects severity and import evidence.",
         ])
 
+    def test_36_finding_export_has_exact_columns_and_preserves_risk_and_remediation(self):
+        findings = [
+            {
+                "package": f"package-{index:02d}",
+                "vulnerability_id": f"OSV-2026-{index:04d}",
+                "severity": "UNKNOWN" if index >= 28 else ("HIGH" if index < 10 else "MEDIUM"),
+                "reachability": "USED",
+                "priority": "UNKNOWN" if index >= 28 else ("HIGH" if index < 10 else "MEDIUM"),
+                "risk_score": 80 - index,
+                "risk_level": "HIGH",
+                "risk_factors": ["Severity contribution", "Reachability contribution"],
+                "risk_explanation": f"Risk explanation for finding {index}.",
+                "installed_version": "1.0.0",
+                "recommended_version": "2.0.0",
+                "recommendation": f"Upgrade package-{index:02d} and validate compatibility.",
+            }
+            for index in range(36)
+        ]
+
+        rows = self.rows(generate_csv_report(findings))
+        self.assertEqual(rows[0], HEADER)
+        self.assertEqual(len(HEADER), 12)
+        self.assertEqual(len(rows), 37)
+        self.assertTrue(all(len(row) == 12 for row in rows))
+        self.assertTrue(all(row[-1] for row in rows[1:]), "unexpected empty trailing column or recommendation")
+        self.assertEqual(rows[1][7], "Severity contribution; Reachability contribution")
+        self.assertEqual(rows[1][8], "Risk explanation for finding 0.")
+        self.assertEqual(rows[-1][11], "Upgrade package-35 and validate compatibility.")
+
     def test_non_mapping_rows_are_skipped(self):
         self.assertEqual(self.rows(generate_csv_report([None, "bad"])), [HEADER])
 
