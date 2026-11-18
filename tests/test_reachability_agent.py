@@ -60,6 +60,7 @@ class ReachabilityAgentTests(unittest.TestCase):
         self.assertTrue(any("@scope/pkg/subpath" in e for e in results["@scope/pkg"]["evidence"]))
 
     def test_ignored_directories(self):
+        self.write("main.py", "print('clean source file')\n")
         for folder in (".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"):
             self.write(f"{folder}/hidden.js", "import 'secret-package';\n")
         self.assertEqual(self.statuses("secret-package")["secret-package"]["status"], "NOT_FOUND")
@@ -70,6 +71,57 @@ class ReachabilityAgentTests(unittest.TestCase):
         self.assertEqual(check_reachability(str(self.root), []), [])
         self.assertEqual(check_reachability(str(self.root), [None, {}, {"name": "x"}]), [])
         self.assertEqual(check_reachability(str(self.root), 42), [])
+
+    def test_empty_project_or_no_supported_source_is_unknown(self):
+        self.assertEqual(self.statuses("requests")["requests"]["status"], "UNKNOWN")
+        self.write("README.md", "import requests\n")
+        self.assertEqual(self.statuses("requests")["requests"]["status"], "UNKNOWN")
+        self.write(".venv/hidden.py", "import requests\n")
+        self.assertEqual(self.statuses("requests")["requests"]["status"], "UNKNOWN")
+
+    def test_python_literal_dynamic_import_calls(self):
+        self.write(
+            "dynamic.py",
+            'import importlib\n'
+            'importlib.import_module("requests")\n'
+            '__import__("flask")\n',
+        )
+        results = self.statuses("requests", "flask")
+        self.assertEqual(results["requests"]["status"], "USED")
+        self.assertEqual(results["flask"]["status"], "USED")
+        self.assertTrue(any("dynamic.py:2: importlib.import_module(\"requests\")" in item
+                            for item in results["requests"]["evidence"]))
+        self.assertTrue(any("dynamic.py:3: __import__(\"flask\")" in item
+                            for item in results["flask"]["evidence"]))
+
+    def test_python_aliased_importlib_dynamic_import_calls(self):
+        self.write(
+            "aliased.py",
+            'import importlib as loader\n'
+            'loader.import_module("requests")\n'
+            'from importlib import import_module as load\n'
+            'load("flask")\n',
+        )
+        results = self.statuses("requests", "flask")
+        self.assertEqual(results["requests"]["status"], "USED")
+        self.assertEqual(results["flask"]["status"], "USED")
+        self.assertTrue(any("aliased.py:2:" in item for item in results["requests"]["evidence"]))
+        self.assertTrue(any("aliased.py:4:" in item for item in results["flask"]["evidence"]))
+
+    def test_javascript_comments_and_ordinary_strings_are_not_import_evidence(self):
+        self.write(
+            "comments.js",
+            '// import \'ghost-package\'\n'
+            '/* require("ghost-package"); import("ghost-package"); */\n'
+            'const example = "import \'ghost-package\'; require(\\"ghost-package\\")";\n'
+            'const template = `import \'ghost-package\'`;\n'
+            'import actual from "actual-package";\n',
+        )
+        results = self.statuses("ghost-package", "actual-package")
+        self.assertEqual(results["ghost-package"]["status"], "NOT_FOUND")
+        self.assertEqual(results["actual-package"]["status"], "USED")
+        self.assertTrue(any("comments.js:5: import actual" in item
+                            for item in results["actual-package"]["evidence"]))
 
     def test_unknown_missing_project_and_unreadable_encoding(self):
         missing = self.root / "does-not-exist"

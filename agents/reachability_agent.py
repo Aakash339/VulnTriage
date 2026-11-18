@@ -34,6 +34,67 @@ _JS_MODULE_RE = re.compile(
 )
 
 
+def _javascript_lexical_info(source: str) -> tuple[str, dict[int, str], bool]:
+    """Mask comments and quoted literals while preserving offsets and newlines.
+
+    The returned literal map lets the caller confirm that a regex match points
+    at an actual module-specifier string, rather than text inside another
+    comment or string. This is deliberately a small lexer, not a JS parser.
+    """
+    masked = list(source)
+    literals: dict[int, str] = {}
+    index = 0
+    length = len(source)
+    reliable = True
+
+    def blank(start: int, end: int) -> None:
+        for position in range(start, end):
+            if source[position] not in "\r\n":
+                masked[position] = " "
+
+    while index < length:
+        if source.startswith("//", index):
+            end = index + 2
+            while end < length and source[end] not in "\r\n":
+                end += 1
+            blank(index, end)
+            index = end
+            continue
+        if source.startswith("/*", index):
+            close = source.find("*/", index + 2)
+            end = length if close == -1 else close + 2
+            if close == -1:
+                reliable = False
+            blank(index, end)
+            index = end
+            continue
+
+        quote = source[index]
+        if quote in {"'", '"', "`"}:
+            start = index
+            end = index + 1
+            closed = False
+            while end < length:
+                if source[end] == "\\":
+                    end = min(end + 2, length)
+                    continue
+                if source[end] == quote:
+                    end += 1
+                    closed = True
+                    break
+                end += 1
+            if not closed:
+                reliable = False
+            content_end = end - 1 if closed else end
+            literals[start] = source[start + 1:content_end]
+            blank(start, end)
+            index = end
+            continue
+        index += 1
+
+    return "".join(masked), literals, reliable
+
+
 def _normalize_name(name: str) -> str:
     """Apply npm/Python package-name normalization for exact comparisons."""
     return re.sub(r"[-_.]+", "-", name).casefold()
@@ -73,14 +134,44 @@ def _add_evidence(evidence: dict, packages: list[str], module: str,
                 evidence[package].append(item)
 
 
+def _python_dynamic_imports(tree: ast.AST):
+    """Yield literal module names and call nodes for common Python loaders."""
+    importlib_aliases = {"importlib"}
+    import_module_aliases: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "importlib" or alias.name.startswith("importlib."):
+                    importlib_aliases.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    import_module_aliases.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function = node.func
+        is_loader = isinstance(function, ast.Name) and (
+            function.id == "__import__" or function.id in import_module_aliases
+        )
+        if isinstance(function, ast.Attribute) and function.attr == "import_module":
+            is_loader = isinstance(function.value, ast.Name) and function.value.id in importlib_aliases
+        argument = node.args[0]
+        if is_loader and isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            yield argument.value, node
+
+
 def check_reachability(project_path: str, vulnerabilities: list) -> list:
     """Return one ReachabilityResult-shaped dictionary per distinct package.
 
-    ``UNKNOWN`` is used when scanning was incomplete and no match was found.
-    JavaScript/TypeScript syntax is recognized with a conservative regular
-    expression rather than a full language parser, so generated or unusual
-    syntax can be missed. Positive evidence is retained even if another file
-    cannot be read or parsed.
+    ``UNKNOWN`` is used when scanning was incomplete, no supported source file
+    was available, or no match was found after an unreliable scan.
+    JavaScript/TypeScript syntax is recognized with a regular expression plus
+    comment/string masking rather than a full language parser, so generated or
+    unusual syntax can be missed. Positive evidence is retained even if another
+    file cannot be read or parsed.
     """
     if not isinstance(vulnerabilities, (list, tuple)):
         return []
@@ -103,6 +194,7 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
         return []
 
     evidence = {package: [] for package in packages}
+    supported_files = 0
     try:
         root = Path(project_path)
         if not root.is_dir():
@@ -126,6 +218,7 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
                     suffix = path.suffix.lower()
                     if suffix not in _SUPPORTED_SUFFIXES:
                         continue
+                    supported_files += 1
                     relative = path.relative_to(root).as_posix()
                     try:
                         if suffix == ".py":
@@ -153,8 +246,24 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
                                 statement = ast.get_source_segment(source, node) or f"from {node.module} import ..."
                                 _add_evidence(evidence, packages, node.module, True,
                                               relative, node.lineno, statement)
+                        for module, node in _python_dynamic_imports(tree):
+                            statement = ast.get_source_segment(source, node) or "dynamic import(...)"
+                            _add_evidence(evidence, packages, module, True,
+                                          relative, node.lineno, statement)
                     else:
+                        code_mask, string_literals, reliable = _javascript_lexical_info(source)
+                        if not reliable:
+                            scan_failed = True
                         for match in _JS_MODULE_RE.finditer(source):
+                            # Reject import-like text inside comments and ordinary
+                            # strings; accept only a real quoted token at this offset.
+                            module_literal = string_literals.get(match.start(1))
+                            if (
+                                code_mask[match.start()].isspace()
+                                or module_literal is None
+                                or module_literal != match.group(2)
+                            ):
+                                continue
                             module = match.group(2)
                             line = source.count("\n", 0, match.start()) + 1
                             line_start = source.rfind("\n", 0, match.start()) + 1
@@ -166,6 +275,10 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
                                           relative, line, statement)
         except (OSError, ValueError):
             scan_failed = True
+
+    # No source files means there was no basis for a negative import finding.
+    if supported_files == 0:
+        scan_failed = True
 
     results = []
     for package in packages:

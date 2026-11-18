@@ -13,6 +13,8 @@ from app import (
     _risk_analysis_summary,
     _sort_findings,
     _navigation_section,
+    _reachability_explanation,
+    _reachability_limitations,
 )
 from reports.report_generator import generate_csv_report
 
@@ -80,6 +82,14 @@ class DashboardFindingTests(unittest.TestCase):
         self.assertEqual(_navigation_section("intelligence"), "intelligence")
         self.assertEqual(_navigation_section("unknown"), "overview")
 
+    def test_reachability_copy_does_not_overclaim_not_found(self):
+        explanation = _reachability_explanation("NOT_FOUND")
+        self.assertIn("not prove", explanation)
+        self.assertIn("safe", explanation)
+        limitations = _reachability_limitations().casefold()
+        for limitation in ("dynamic loading", "reflection", "plugins", "transitive"):
+            self.assertIn(limitation, limitations)
+
     def test_summary_uses_findings(self):
         self.assertEqual(_finding_summary(self.findings), {
             "total": 5,
@@ -116,7 +126,11 @@ class DashboardFindingTests(unittest.TestCase):
             defaults["soc-reachability"], defaults["soc-sort"],
         )
         filtered = _prepare_queue(findings, {"HIGH"}, set(), "All", SORT_OPTIONS[0])
-        csv_rows = list(csv.reader(io.StringIO(generate_csv_report(findings).decode("utf-8"))))
+        reachability = [
+            {"package": finding["package"], "status": finding["reachability"], "evidence": []}
+            for finding in findings
+        ]
+        csv_rows = list(csv.reader(io.StringIO(generate_csv_report(findings, reachability).decode("utf-8"))))
         self.assertEqual(len(restored), 36)
         self.assertEqual(len(filtered), 10)
         self.assertEqual(len(csv_rows) - 1, 36)

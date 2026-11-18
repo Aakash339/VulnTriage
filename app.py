@@ -270,6 +270,23 @@ def _reachability_counts(findings: list) -> dict[str, int]:
     return counts
 
 
+def _reachability_explanation(status: str) -> str:
+    """Explain status as a static-analysis signal, not an exploitability verdict."""
+    normalized = status.strip().upper() if isinstance(status, str) else "UNKNOWN"
+    if normalized == "USED":
+        return "A matching import expression was detected. This does not prove the code executes or is exploitable."
+    if normalized == "NOT_FOUND":
+        return "No matching import was detected in supported files; this does not prove the package is unused or safe."
+    return "The scan could not reliably determine whether a matching import exists."
+
+
+def _reachability_limitations() -> str:
+    return (
+        "Static analysis may miss dynamic loading, reflection, plugins, and indirect or transitive use. "
+        "NOT_FOUND is not proof that a dependency is unused or safe."
+    )
+
+
 def _risk_analysis_summary(findings: list) -> dict[str, object]:
     scores = [score for finding in findings if (score := _risk_score(finding)) is not None]
     reachability = _reachability_counts(findings)
@@ -580,6 +597,7 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
     st.title("Vulnerability Investigation")
     st.subheader("Priority queue")
     st.caption("Risk score is a deterministic triage heuristic. Filtered rows affect the queue and details; the report retains every finding.")
+    st.caption(_reachability_limitations())
     severities = sorted({_normal_severity(item) for item in findings})
     finding_priorities = sorted({_field_text(item, "priority").upper() for item in findings})
     controls = st.columns([1.25, 1, 1, 1])
@@ -662,7 +680,9 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
             right.write(f"Installed: {_field_text(finding, 'installed_version', 'Not provided')}")
             right.write(f"OSV fixed version: {_field_text(finding, 'recommended_version', 'Not provided')}")
             right.write(_field_text(finding, "recommendation", "No remediation instruction was provided."))
-            right.markdown("**Reachability evidence**")
+            right.markdown("**Static Import Evidence**")
+            reachability_status = _field_text(finding, "reachability").upper()
+            right.caption(_reachability_explanation(reachability_status))
             records = reach_by_package.get(package.casefold(), [])
             evidence = []
             for record in records:
@@ -673,7 +693,7 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
                 for item in evidence:
                     right.code(item, language=None)
             else:
-                right.write("No import evidence was provided for this finding.")
+                right.write("No matching static import evidence was collected.")
             references = vulnerability.get("references", []) if isinstance(vulnerability, dict) else []
             if isinstance(references, list) and references:
                 right.markdown("**OSV references**")
@@ -841,14 +861,14 @@ def _render_distribution(counts: dict[str, int], order: tuple[str, ...]) -> None
         )
 
 
-def _render_reports(findings: list[dict], scan_completed: bool) -> None:
+def _render_reports(findings: list[dict], scan_completed: bool, reachability_records: list | None = None) -> None:
     st.markdown('<div class="soc-section-kicker">04 / Reports</div>', unsafe_allow_html=True)
     st.title("Scan Reports")
     st.caption("Export the complete scan result as CSV. Queue filters and sorting do not affect the report.")
     if scan_completed:
         st.download_button(
             "⬇  Export complete CSV report",
-            data=generate_csv_report(findings),
+            data=generate_csv_report(findings, reachability_records),
             file_name="vulntriage-report.csv",
             mime="text/csv",
             type="primary",
@@ -1023,7 +1043,7 @@ def main() -> None:
     elif active_section == "intelligence":
         _render_analytics(findings, vulnerabilities, matching_scan)
     elif active_section == "reports":
-        _render_reports(findings if matching_scan else [], matching_scan)
+        _render_reports(findings if matching_scan else [], matching_scan, reachability if matching_scan else [])
 
 
 if __name__ == "__main__":
