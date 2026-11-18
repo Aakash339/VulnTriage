@@ -569,7 +569,7 @@ def _render_theme() -> None:
     .stApp { background:radial-gradient(ellipse at 18% -15%, #10283c 0, transparent 42%), var(--bg); color:var(--text); }
     [data-testid="stSidebar"] { background:#091522; border-right:1px solid var(--line); min-width:250px; }
     [data-testid="stSidebar"] section { padding:1.25rem .9rem; }
-    .block-container { max-width:1600px; padding:1.1rem clamp(1rem,2.3vw,2.5rem) 2.5rem; }
+    .block-container { max-width:1600px; padding:4.5rem clamp(1rem,2.3vw,2.5rem) 2.5rem; }
     h1,h2,h3 { color:#f2f7fb; letter-spacing:-.025em; }
     h1 { font-size:2rem !important; } h2 { font-size:1.55rem !important; } h3 { font-size:1.18rem !important; }
     p, li, label, [data-testid="stCaptionContainer"] { color:#d1dce6; }
