@@ -1,0 +1,179 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from agents.dependency_agent import parse_dependencies
+
+
+class DependencyAgentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def put(self, name, content):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def deps(self, ecosystem=None):
+        values = parse_dependencies(str(self.root))
+        return [d for d in values if ecosystem is None or d["ecosystem"] == ecosystem]
+
+    def package(self, data):
+        return self.put("package.json", json.dumps(data))
+
+    # Python requirements behavior
+    def test_01_exact_pin(self):
+        self.put("requirements.txt", "requests==2.31.0\n")
+        self.assertEqual(self.deps("PyPI")[0]["version"], "2.31.0")
+
+    def test_02_version_range(self):
+        self.put("requirements.txt", "requests>=2.0\n")
+        self.assertEqual(self.deps("PyPI")[0]["version"], ">=2.0")
+
+    def test_03_extras(self):
+        self.put("requirements.txt", "requests[security]==2.31.0\n")
+        self.assertEqual(self.deps("PyPI")[0]["name"], "requests")
+
+    def test_04_comments_and_blanks(self):
+        self.put("requirements.txt", "# comment\n\nrequests==2\n")
+        self.assertEqual(len(self.deps("PyPI")), 1)
+
+    def test_05_duplicate_python_dependencies(self):
+        self.put("requirements.txt", "Requests==2\nrequests==2\n")
+        self.assertEqual(len(self.deps("PyPI")), 1)
+
+    def test_06_environment_marker(self):
+        self.put("requirements.txt", "foo>=1; python_version < '4'\n")
+        self.assertEqual(self.deps("PyPI")[0]["version"], ">=1")
+
+    def test_07_invalid_requirement_skipped(self):
+        self.put("requirements.txt", "not a valid requirement !!!\n")
+        self.assertEqual(self.deps("PyPI"), [])
+
+    def test_08_empty_requirements(self):
+        self.put("requirements.txt", "")
+        self.assertEqual(self.deps(), [])
+
+    def test_09_missing_requirements(self):
+        self.assertEqual(self.deps(), [])
+
+    def test_10_direct_url_requirement(self):
+        self.put("requirements.txt", "demo @ https://example.test/demo.whl\n")
+        self.assertEqual(self.deps("PyPI")[0]["version"], "https://example.test/demo.whl")
+
+    # package.json behavior
+    def test_11_dependencies(self):
+        self.package({"dependencies": {"left-pad": "1.3.0"}})
+        self.assertEqual(self.deps("npm")[0]["version"], "1.3.0")
+
+    def test_12_dev_dependencies(self):
+        self.package({"devDependencies": {"jest": "^29.0"}})
+        self.assertEqual(self.deps("npm")[0]["name"], "jest")
+
+    def test_13_optional_dependencies(self):
+        self.package({"optionalDependencies": {"fsevents": "~2.0"}})
+        self.assertEqual(self.deps("npm")[0]["version"], "~2.0")
+
+    def test_14_peer_dependencies(self):
+        self.package({"peerDependencies": {"react": ">=18"}})
+        self.assertEqual(self.deps("npm")[0]["version"], ">=18")
+
+    def test_15_scoped_package(self):
+        self.package({"dependencies": {"@scope/pkg": "1.2.3"}})
+        self.assertEqual(self.deps("npm")[0]["name"], "@scope/pkg")
+
+    def test_16_npm_version_range(self):
+        self.package({"dependencies": {"x": "^1.2.0"}})
+        self.assertEqual(self.deps("npm")[0]["version"], "^1.2.0")
+
+    def test_17_malformed_json(self):
+        self.put("package.json", "{")
+        self.assertEqual(self.deps("npm"), [])
+
+    def test_18_duplicate_package_sections(self):
+        self.package({"dependencies": {"x": "1"}, "devDependencies": {"x": "1"}})
+        self.assertEqual(len(self.deps("npm")), 1)
+
+    def test_19_wildcard_version(self):
+        self.package({"dependencies": {"x": "*"}})
+        self.assertEqual(self.deps("npm")[0]["version"], "*")
+
+    # Lockfiles
+    def test_20_lockfile_v2(self):
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 2, "packages": {"": {}, "node_modules/a": {"version": "1.0"}}}))
+        self.assertEqual(self.deps("npm")[0]["version"], "1.0")
+
+    def test_21_lockfile_v3(self):
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 3, "packages": {"node_modules/a": {"version": "2.0"}}}))
+        self.assertEqual(self.deps("npm")[0]["version"], "2.0")
+
+    def test_22_lockfile_v1(self):
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 1, "dependencies": {"a": {"version": "1.0"}}}))
+        self.assertEqual(self.deps("npm")[0]["version"], "1.0")
+
+    def test_23_nested_lock_dependencies(self):
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 1, "dependencies": {"a": {"version": "1", "dependencies": {"b": {"version": "2"}}}}}))
+        self.assertEqual({d["name"] for d in self.deps("npm")}, {"a", "b"})
+
+    def test_24_scoped_lock_package(self):
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 3, "packages": {"node_modules/@scope/pkg": {"version": "1"}}}))
+        self.assertEqual(self.deps("npm")[0]["name"], "@scope/pkg")
+
+    def test_25_transitive_lock_package(self):
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 3, "packages": {"node_modules/a": {"version": "1"}, "node_modules/a/node_modules/b": {"version": "2"}}}))
+        self.assertEqual(len(self.deps("npm")), 2)
+
+    def test_26_lock_precedence(self):
+        self.package({"dependencies": {"a": "^1"}})
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 3, "packages": {"node_modules/a": {"version": "1.4.0"}}}))
+        found = self.deps("npm")
+        self.assertEqual([(d["version"], d["source_file"]) for d in found], [("1.4.0", "package-lock.json")])
+
+    def test_27_malformed_lock_falls_back(self):
+        self.package({"dependencies": {"a": "^1"}})
+        self.put("package-lock.json", "{")
+        self.assertEqual(self.deps("npm")[0]["version"], "^1")
+
+    def test_28_lock_root_excluded(self):
+        self.put("package-lock.json", json.dumps({"lockfileVersion": 3, "packages": {"": {"name": "root", "version": "1"}}}))
+        self.assertEqual(self.deps("npm"), [])
+
+    # General scanning and normalization
+    def test_29_missing_project(self):
+        self.assertEqual(parse_dependencies(str(self.root / "missing")), [])
+
+    def test_30_ignored_directories(self):
+        for folder in (".git", ".venv", "venv", "node_modules", "__pycache__"):
+            self.put(f"{folder}/requirements.txt", "hidden==1\n")
+        self.assertEqual(self.deps(), [])
+
+    def test_31_empty_project(self):
+        self.assertEqual(self.deps(), [])
+
+    def test_32_duplicate_name_version_across_files(self):
+        self.put("requirements.txt", "a==1\n")
+        self.put("sub/requirements.txt", "A==1\n")
+        self.assertEqual(len(self.deps("PyPI")), 1)
+
+    def test_33_mixed_project(self):
+        self.put("requirements.txt", "requests==2.0\n")
+        self.package({"dependencies": {"left-pad": "1.0"}})
+        self.assertEqual({d["ecosystem"] for d in self.deps()}, {"PyPI", "npm"})
+
+    def test_34_exact_contract_fields(self):
+        self.put("requirements.txt", "foo==1\n")
+        self.assertEqual(set(self.deps()[0]), {"name", "version", "ecosystem", "source_file"})
+
+    def test_35_requirement_multiple_constraints(self):
+        self.put("requirements.txt", "foo>=1,<3\n")
+        self.assertEqual(self.deps("PyPI")[0]["version"], "<3,>=1")
+
+
+if __name__ == "__main__":
+    unittest.main()
