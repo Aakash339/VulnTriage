@@ -43,7 +43,7 @@ def test_matching_records_produce_review_required_with_evidence():
     assert any("requirements.txt" in item for item in result["evidence_used"])
     assert any("OSV fixed version 2.31.0" in item for item in result["evidence_used"])
     assert any("app.py:1" in item for item in result["evidence_used"])
-    assert "not been verified" in result["explanation"]
+    assert "unverified" in result["explanation"]
 
 
 def test_package_matching_is_ecosystem_aware():
@@ -55,8 +55,8 @@ def test_package_matching_is_ecosystem_aware():
 
     assert result["assessment_status"] == "NOT_ASSESSED"
     assert result["candidate_fixed_versions"] == ["2.0"]
-    assert "No dependency record matched" in result["explanation"]
-    assert "No reachability record matched" in result["explanation"]
+    assert "No dependency matched both ecosystem and package identity" in result["explanation"]
+    assert "No matching reachability record" in result["explanation"]
 
 
 def test_python_distribution_identity_uses_python_normalization():
@@ -69,6 +69,16 @@ def test_python_distribution_identity_uses_python_normalization():
     assert result["assessment_status"] == "REVIEW_REQUIRED"
 
 
+def test_valid_python_epoch_version_is_preserved():
+    result = assess(
+        deps=[dependency("requests", "1!2.0", "PyPI")],
+        vulns=[vulnerability("requests", "1!2.0", "PyPI", ["1!3.0"])],
+    )[0]
+
+    assert result["assessment_status"] == "REVIEW_REQUIRED"
+    assert result["installed_version"] == "1!2.0"
+
+
 def test_maven_coordinates_are_matched_exactly():
     result = assess(
         deps=[dependency("org.example:my-artifact", "1.0.Final", "Maven")],
@@ -77,7 +87,20 @@ def test_maven_coordinates_are_matched_exactly():
     )[0]
 
     assert result["assessment_status"] == "NOT_ASSESSED"
-    assert "No dependency record matched" in result["explanation"]
+    assert "No dependency matched both ecosystem and package identity" in result["explanation"]
+
+
+def test_exact_maven_coordinate_and_non_semver_version_can_be_reviewed():
+    result = assess(
+        deps=[dependency("org.example:artifact", "1.0.Final", "Maven", "pom.xml")],
+        vulns=[vulnerability("org.example:artifact", "1.0.Final", "Maven", ["2.0.Final"])],
+        reaches=[reachability("org.example:artifact", "Maven", "UNKNOWN", [])],
+    )[0]
+
+    assert result["assessment_status"] == "REVIEW_REQUIRED"
+    assert result["installed_version"] == "1.0.Final"
+    assert result["candidate_fixed_versions"] == ["2.0.Final"]
+    assert any("pom.xml" in item for item in result["evidence_used"])
 
 
 def test_only_osv_supplied_fixed_versions_are_candidates():
@@ -85,6 +108,15 @@ def test_only_osv_supplied_fixed_versions_are_candidates():
 
     assert result["candidate_fixed_versions"] == ["2.0"]
     assert all("3.0" not in candidate for candidate in result["candidate_fixed_versions"])
+    assert "not a usable literal" in result["explanation"]
+
+
+def test_multiple_fixed_versions_require_selection_and_testing():
+    result = assess(vulns=[vulnerability(fixed=["2.0", "2.1"])])[0]
+
+    assert result["assessment_status"] == "REVIEW_REQUIRED"
+    assert result["candidate_fixed_versions"] == ["2.0", "2.1"]
+    assert "Multiple OSV fixed versions are available" in result["explanation"]
 
 
 def test_missing_or_unresolved_dependency_version_is_not_assessed():
@@ -95,6 +127,18 @@ def test_missing_or_unresolved_dependency_version_is_not_assessed():
         )[0]
         assert result["assessment_status"] == "NOT_ASSESSED"
         assert result["installed_version"] == "1.0"
+        assert "missing or non-literal version" in result["explanation"]
+
+
+def test_malformed_npm_versions_are_not_treated_as_resolved():
+    result = assess(
+        deps=[dependency("left-pad", "not-a-version", "npm")],
+        vulns=[vulnerability("left-pad", "not-a-version", "npm", ["2.0.0"])],
+        reaches=[reachability("left-pad", "npm")],
+    )[0]
+
+    assert result["assessment_status"] == "NOT_ASSESSED"
+    assert result["installed_version"] == ""
 
 
 def test_conflicting_dependency_and_osv_versions_are_not_assessed():
@@ -105,7 +149,7 @@ def test_conflicting_dependency_and_osv_versions_are_not_assessed():
 
     assert result["assessment_status"] == "NOT_ASSESSED"
     assert result["installed_version"] == ""
-    assert "conflicting installed versions" in result["explanation"]
+    assert "ambiguous or inconsistent" in result["explanation"]
 
 
 def test_missing_dependency_or_vulnerability_version_is_conservative():
@@ -123,7 +167,7 @@ def test_no_osv_fix_is_not_assessed_and_candidate_list_is_empty():
 
     assert result["assessment_status"] == "NOT_ASSESSED"
     assert result["candidate_fixed_versions"] == []
-    assert "No fixed-version candidate" in result["explanation"]
+    assert "No usable fixed-version candidate" in result["explanation"]
 
 
 def test_ambiguous_reachability_is_preserved_as_evidence_not_a_compatibility_claim():
@@ -135,7 +179,7 @@ def test_ambiguous_reachability_is_preserved_as_evidence_not_a_compatibility_cla
     assert result["assessment_status"] == "REVIEW_REQUIRED"
     assert "Reachability status: USED" in result["evidence_used"]
     assert "Reachability status: UNKNOWN" in result["evidence_used"]
-    assert "not been verified" in result["explanation"]
+    assert "unverified" in result["explanation"]
 
 
 def test_malformed_and_empty_inputs_are_safe():

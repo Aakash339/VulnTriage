@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
@@ -42,12 +44,17 @@ def _identity(record: dict[str, Any], package_field: str) -> tuple[str, str] | N
     return ecosystem, _package_identity(ecosystem, package)
 
 
-def _resolved_literal_version(value: Any) -> str | None:
-    """Accept only a conservative literal version, preserving it verbatim."""
+def _resolved_literal_version(value: Any, ecosystem: str) -> str | None:
+    """Accept a conservative literal version, preserving its original spelling.
+
+    This is intentionally a screening check, not a full version-range engine.
+    Values that look like selectors, placeholders, URLs, or malformed tokens
+    are not treated as resolved installed/fixed versions.
+    """
     version = _text(value)
     if not version or any(character.isspace() for character in version):
         return None
-    if any(token in version for token in ("$", "${", "}", "<", ">", "=", "!", "~", "^", "*", ",", "|")):
+    if any(token in version for token in ("$", "${", "}", "<", ">", "=", "~", "^", "*", ",", "|")):
         return None
     if version.startswith(("[", "(", "-e ")) or "://" in version:
         return None
@@ -57,6 +64,21 @@ def _resolved_literal_version(value: Any) -> str | None:
         return None
     # Common npm wildcard selectors are not exact resolved versions.
     if re.search(r"(?:^|\.)x(?:$|\.)", version, re.IGNORECASE):
+        return None
+    token_pattern = r"[A-Za-z0-9][A-Za-z0-9.!_+-]*" if ecosystem == "PyPI" else r"[A-Za-z0-9][A-Za-z0-9._+-]*"
+    if not re.fullmatch(token_pattern, version):
+        return None
+    if ecosystem == "PyPI":
+        try:
+            Version(version)
+        except InvalidVersion:
+            return None
+    if ecosystem == "npm" and not re.fullmatch(
+        r"^v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+        r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$",
+        version,
+    ):
         return None
     return version
 
@@ -111,17 +133,21 @@ def analyze_compatibility(
         evidence_used: list[str] = []
         explanations: list[str] = []
         installed_versions: set[str] = set()
+        dependency_versions: set[str] = set()
+        osv_versions: set[str] = set()
         version_data_incomplete = False
 
         for dependency in dependency_records:
             raw_version = dependency.get("version")
-            version = _resolved_literal_version(raw_version)
+            version = _resolved_literal_version(raw_version, ecosystem)
             if version is None:
                 version_data_incomplete = True
-                if _text(raw_version):
-                    explanations.append("A dependency version is a range, unresolved value, or otherwise not an exact version.")
+                explanations.append(
+                    "A dependency record has a missing or non-literal version; resolve it from a lockfile or manifest before review."
+                )
             else:
                 installed_versions.add(version)
+                dependency_versions.add(version)
                 source_file = _text(dependency.get("source_file"))
                 detail = f"Dependency version {version}"
                 if source_file:
@@ -130,12 +156,13 @@ def analyze_compatibility(
                     evidence_used.append(detail)
 
         for vulnerability in vuln_records:
-            installed = _resolved_literal_version(vulnerability.get("installed_version"))
+            installed = _resolved_literal_version(vulnerability.get("installed_version"), ecosystem)
             if installed is None:
                 version_data_incomplete = True
-                explanations.append("An OSV finding is missing a usable exact installed version.")
+                explanations.append("An OSV finding has a missing or invalid installed version.")
             else:
                 installed_versions.add(installed)
+                osv_versions.add(installed)
 
             vuln_id = _text(vulnerability.get("vulnerability_id")) or "OSV finding"
             raw_fixed = vulnerability.get("fixed_versions")
@@ -144,24 +171,39 @@ def analyze_compatibility(
                     candidate = _text(raw_candidate)
                     # Candidate provenance remains the supplied OSV record. Do
                     # not derive or transform any version strings here.
-                    if candidate and _resolved_literal_version(candidate) is None:
-                        explanations.append("An OSV fixed-version value is unresolved or not a single literal version.")
+                    if candidate and _resolved_literal_version(candidate, ecosystem) is None:
+                        explanations.append(
+                            "An OSV fixed-version value is not a usable literal for this ecosystem and was excluded."
+                        )
                     elif candidate and candidate not in candidate_versions:
                         candidate_versions.append(candidate)
                         evidence_used.append(f"{vuln_id} lists OSV fixed version {candidate}")
 
         if len(installed_versions) > 1:
-            explanations.append("Dependency and OSV records contain conflicting installed versions.")
+            explanations.append(
+                "Installed-version evidence is ambiguous or inconsistent "
+                f"({', '.join(sorted(installed_versions))}); confirm the resolved version in the lockfile."
+            )
+        if dependency_versions and osv_versions and dependency_versions != osv_versions:
+            explanations.append(
+                "The dependency record and OSV finding disagree on the installed version; confirm which version is resolved."
+            )
         if not dependency_records:
-            explanations.append("No dependency record matched this vulnerability by ecosystem and package identity.")
+            explanations.append(
+                "No dependency matched both ecosystem and package identity; verify the dependency inventory and coordinates."
+            )
         if not candidate_versions:
-            explanations.append("No fixed-version candidate was supplied by a matching OSV finding.")
+            explanations.append(
+                "No usable fixed-version candidate was supplied by a matching OSV finding; review the advisory for mitigation guidance."
+            )
         if not matching_reachability:
-            explanations.append("No reachability record matched this ecosystem and package; source usage context is unavailable.")
+            explanations.append("No matching reachability record is available; source usage context is unknown.")
         else:
+            reachability_statuses: set[str] = set()
             for record in matching_reachability:
                 status = _text(record.get("status")).upper()
                 if status:
+                    reachability_statuses.add(status)
                     evidence_used.append(f"Reachability status: {status}")
                 values = record.get("evidence")
                 if isinstance(values, (list, tuple)):
@@ -169,6 +211,8 @@ def analyze_compatibility(
                         item for item in values
                         if isinstance(item, str) and item.strip() and item not in evidence_used
                     )
+            if len(reachability_statuses) > 1:
+                explanations.append("Reachability records disagree; treat source usage context as uncertain.")
 
         installed_version = next(iter(installed_versions)) if len(installed_versions) == 1 else ""
         version_consistent = (
@@ -182,14 +226,16 @@ def analyze_compatibility(
             else "NOT_ASSESSED"
         )
         if status == "REVIEW_REQUIRED":
-            explanations.append(
-                "A matching OSV fixed-version candidate and a consistent installed version are available, "
-                "but API compatibility and application behavior have not been verified. Test the upgrade before deployment."
-            )
+            if len(candidate_versions) > 1:
+                explanations.append(
+                    "Multiple OSV fixed versions are available; select one using advisory and project constraints, then test the upgrade."
+                )
+            else:
+                explanations.append(
+                    "An OSV fixed-version candidate is available, but API compatibility and application behavior are unverified; test the upgrade before deployment."
+                )
         else:
-            explanations.append(
-                "Compatibility was not assessed because the required package, version, or OSV fix information is missing or ambiguous."
-            )
+            explanations.append("Compatibility was not assessed; resolve the evidence gaps above before choosing an upgrade.")
 
         assessments.append({
             "package": package,
