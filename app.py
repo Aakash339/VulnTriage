@@ -21,6 +21,15 @@ MAX_ARCHIVE_FILES = 10_000
 MAX_SINGLE_FILE_BYTES = 100 * 1024 * 1024
 IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
 PROJECT_MANIFESTS = {"requirements.txt", "package.json", "package-lock.json"}
+PRIORITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
+SORT_OPTIONS = (
+    "Priority (Highest first)",
+    "Severity (Highest first)",
+    "Package name (A–Z)",
+    "Reachability (USED first)",
+    "Vulnerability ID (A–Z)",
+)
 
 
 class ArchiveValidationError(ValueError):
@@ -118,33 +127,166 @@ def _finding_columns() -> list[str]:
         "severity",
         "reachability",
         "priority",
+        "risk_score",
+        "risk_level",
+        "risk_factors",
+        "risk_explanation",
         "installed_version",
         "recommended_version",
         "recommendation",
     ]
 
 
+def _field_text(finding, field: str, default: str = "UNKNOWN") -> str:
+    if not isinstance(finding, dict):
+        return default
+    value = finding.get(field)
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _priority_rank(finding) -> int:
+    return PRIORITY_ORDER.get(_field_text(finding, "priority").upper(), PRIORITY_ORDER["UNKNOWN"])
+
+
+def _severity_rank(finding) -> int:
+    return SEVERITY_ORDER.get(_field_text(finding, "severity").upper(), SEVERITY_ORDER["UNKNOWN"])
+
+
+def _sort_findings(findings: list, sort_option: str = SORT_OPTIONS[0]) -> list:
+    """Return a sorted display copy, leaving the source findings untouched."""
+    rows = list(findings)
+
+    def package_key(finding):
+        return _field_text(finding, "package", "").casefold()
+
+    def priority_key(finding):
+        return (_priority_rank(finding), _severity_rank(finding), package_key(finding))
+
+    if sort_option == "Severity (Highest first)":
+        key = lambda finding: (_severity_rank(finding), _priority_rank(finding), package_key(finding))
+    elif sort_option == "Package name (A–Z)":
+        key = lambda finding: (package_key(finding), _priority_rank(finding), _severity_rank(finding))
+    elif sort_option == "Reachability (USED first)":
+        reach_order = {"USED": 0, "NOT_FOUND": 1, "UNKNOWN": 2}
+        key = lambda finding: (
+            reach_order.get(_field_text(finding, "reachability").upper(), 3),
+            _priority_rank(finding), _severity_rank(finding), package_key(finding),
+        )
+    elif sort_option == "Vulnerability ID (A–Z)":
+        key = lambda finding: (
+            _field_text(finding, "vulnerability_id", "").casefold(),
+            _priority_rank(finding), _severity_rank(finding), package_key(finding),
+        )
+    else:
+        key = priority_key
+    return sorted(rows, key=key)
+
+
+def _filter_findings(findings: list, severities: set[str], priorities: set[str], reachability: str) -> list:
+    """Filter without changing or dropping rows except by selected criteria."""
+    filtered = []
+    for finding in findings:
+        severity = _field_text(finding, "severity").upper()
+        priority = _field_text(finding, "priority").upper()
+        reach = _field_text(finding, "reachability").upper()
+        if severity not in severities or priority not in priorities:
+            continue
+        if reachability != "All" and reach != reachability:
+            continue
+        filtered.append(finding)
+    return filtered
+
+
+def _finding_summary(findings: list) -> dict[str, int]:
+    packages = {
+        package.casefold()
+        for finding in findings
+        if (package := _field_text(finding, "package", ""))
+    }
+    return {
+        "total": len(findings),
+        "unique_packages": len(packages),
+        "used": sum(_field_text(finding, "reachability").upper() == "USED" for finding in findings),
+        "unknown_reachability": sum(
+            _field_text(finding, "reachability").upper() == "UNKNOWN" for finding in findings
+        ),
+    }
+
+
+def _table_rows(findings: list) -> list[dict]:
+    return [
+        {column: (finding.get(column) if isinstance(finding, dict) else None) for column in _finding_columns()}
+        for finding in findings
+    ]
+
+
 def _render_findings(findings: list[dict]) -> None:
     priorities = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"]
-    metric_columns = st.columns(1 + len(priorities))
-    metric_columns[0].metric("Total findings", len(findings))
-    for column, priority in zip(metric_columns[1:], priorities):
-        count = sum(item.get("priority") == priority for item in findings)
+    summary = _finding_summary(findings)
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Total findings", summary["total"])
+    summary_columns[1].metric("Unique affected packages", summary["unique_packages"])
+    summary_columns[2].metric("USED findings", summary["used"])
+    summary_columns[3].metric("Findings to investigate", summary["unknown_reachability"])
+
+    priority_columns = st.columns(len(priorities))
+    for column, priority in zip(priority_columns, priorities):
+        count = sum(_field_text(item, "priority").upper() == priority for item in findings)
         column.metric(f"{priority} priority", count)
 
     st.subheader("Findings")
-    severities = sorted({item.get("severity", "UNKNOWN") for item in findings})
-    finding_priorities = sorted({item.get("priority", "UNKNOWN") for item in findings})
-    filter_columns = st.columns(2)
-    selected_severities = filter_columns[0].multiselect("Filter by severity", severities, default=severities)
-    selected_priorities = filter_columns[1].multiselect("Filter by priority", finding_priorities, default=finding_priorities)
-    filtered = [
-        item for item in findings
-        if item.get("severity", "UNKNOWN") in selected_severities
-        and item.get("priority", "UNKNOWN") in selected_priorities
-    ]
+    severities = sorted({_field_text(item, "severity").upper() for item in findings})
+    finding_priorities = sorted({_field_text(item, "priority").upper() for item in findings})
+    filter_columns = st.columns(4)
+    sort_option = filter_columns[0].selectbox("Sort findings", SORT_OPTIONS, index=0)
+    selected_severities = filter_columns[1].multiselect("Filter by severity", severities, default=severities)
+    selected_priorities = filter_columns[2].multiselect("Filter by priority", finding_priorities, default=finding_priorities)
+    selected_reachability = filter_columns[3].selectbox(
+        "Filter by reachability", ["All", "USED", "NOT_FOUND", "UNKNOWN"], index=0
+    )
+    filtered = _filter_findings(findings, set(selected_severities), set(selected_priorities), selected_reachability)
+    sorted_findings = _sort_findings(filtered, sort_option)
     if filtered:
-        st.dataframe(filtered, use_container_width=True, hide_index=True, column_order=_finding_columns())
+        st.dataframe(
+            _table_rows(sorted_findings),
+            use_container_width=True,
+            hide_index=True,
+            column_order=_finding_columns(),
+            column_config={
+                "package": st.column_config.TextColumn("package", width="medium"),
+                "vulnerability_id": st.column_config.TextColumn("vulnerability_id", width="medium"),
+                "severity": st.column_config.TextColumn("severity", width="small"),
+                "reachability": st.column_config.TextColumn("reachability", width="small"),
+                "priority": st.column_config.TextColumn("priority", width="small"),
+                "risk_score": st.column_config.NumberColumn("risk_score", width="small", format="%d/100"),
+                "risk_level": st.column_config.TextColumn("risk_level", width="small"),
+                "risk_factors": st.column_config.TextColumn("risk_factors", width="large"),
+                "risk_explanation": st.column_config.TextColumn(
+                    "risk_explanation", width="large", help="Full explanation is also available below."
+                ),
+                "installed_version": st.column_config.TextColumn("installed_version", width="small"),
+                "recommended_version": st.column_config.TextColumn("recommended_version", width="medium"),
+                "recommendation": st.column_config.TextColumn(
+                    "recommendation", width="large", help="Expand a row below to read the full recommendation."
+                ),
+            },
+            height=560,
+        )
+        with st.expander("Read full recommendations"):
+            for finding in sorted_findings:
+                package = _field_text(finding, "package", "(unknown package)")
+                vulnerability_id = _field_text(finding, "vulnerability_id", "(unknown vulnerability)")
+                recommendation = _field_text(finding, "recommendation", "No recommendation provided.")
+                risk_explanation = _field_text(finding, "risk_explanation", "Risk explanation unavailable.")
+                risk_score = finding.get("risk_score") if isinstance(finding, dict) else None
+                risk_score = risk_score if isinstance(risk_score, (int, float)) else "N/A"
+                st.markdown(
+                    f"**{package} · {vulnerability_id}**\n\n"
+                    f"**Recommendation:** {recommendation}\n\n"
+                    f"**Risk:** {risk_score}/100 · "
+                    f"{_field_text(finding, 'risk_level', 'UNKNOWN')}\n\n"
+                    f"{risk_explanation}"
+                )
     else:
         st.info("No findings match the selected filters.")
 

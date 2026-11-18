@@ -11,6 +11,10 @@ _COLUMNS = (
     ("Severity", "severity"),
     ("Reachability", "reachability"),
     ("Priority", "priority"),
+    ("Risk Score", "risk_score"),
+    ("Risk Level", "risk_level"),
+    ("Risk Factors", "risk_factors"),
+    ("Risk Explanation", "risk_explanation"),
     ("Installed Version", "installed_version"),
     ("Recommended Version", "recommended_version"),
     ("Recommendation", "recommendation"),
@@ -31,4 +35,6 @@ def generate_csv_report(findings: list) -> bytes:
 
 
 def _csv_value(value) -> str:
+    if isinstance(value, (list, tuple)):
+        return "; ".join(str(item) for item in value)
     return value if isinstance(value, str) else ("" if value is None else str(value))

@@ -65,6 +65,7 @@ class RemediationAgentTests(unittest.TestCase):
         self.assertEqual(generate_remediation([vuln()], [] )[0].keys(), {
             "package", "vulnerability_id", "severity", "reachability", "priority",
             "installed_version", "recommended_version", "recommendation",
+            "risk_score", "risk_level", "risk_factors", "risk_explanation",
         })
 
 

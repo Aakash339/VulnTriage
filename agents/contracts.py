@@ -39,3 +39,7 @@ class RemediationFinding(TypedDict):
     installed_version: str
     recommended_version: str
     recommendation: str
+    risk_score: int
+    risk_level: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    risk_factors: list[str]
+    risk_explanation: str

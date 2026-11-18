@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from utils.risk_engine import calculate_risk
+
 
 _SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 _PRIORITY_DOWNGRADE = {"CRITICAL": "HIGH", "HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "INFO"}
@@ -72,13 +74,15 @@ def generate_remediation(vulnerabilities: list, reachability: list) -> list:
     reach_records = [r for r in reachability if isinstance(r, dict)] if isinstance(reachability, list) else []
 
     statuses: dict[str, set[str]] = {}
+    reach_records_by_package: dict[str, list[dict]] = {}
     for record in reach_records:
         package = _package_key(record)
         status = _text(record.get("status")).upper()
         if package:
             statuses.setdefault(package, set()).add(status if status in {"USED", "NOT_FOUND", "UNKNOWN"} else "UNKNOWN")
+            reach_records_by_package.setdefault(package, []).append(record)
 
-    findings: list[dict[str, str]] = []
+    findings: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for vulnerability in vuln_records:
         package = _text(vulnerability.get("package"))
@@ -95,6 +99,14 @@ def generate_remediation(vulnerabilities: list, reachability: list) -> list:
         matches = statuses.get(package.casefold(), set())
         reach = next(iter(matches)) if len(matches) == 1 else "UNKNOWN"
         recommended, recommendation = _recommendation(package, _fixed_versions(vulnerability))
+        evidence = []
+        for record in reach_records_by_package.get(package.casefold(), []):
+            values = record.get("evidence")
+            if isinstance(values, (list, tuple)):
+                for value in values:
+                    if isinstance(value, str) and value.strip() and value not in evidence:
+                        evidence.append(value)
+        risk = calculate_risk(vulnerability, {"package": package, "status": reach, "evidence": evidence})
         findings.append({
             "package": package,
             "vulnerability_id": vuln_id,
@@ -104,5 +116,6 @@ def generate_remediation(vulnerabilities: list, reachability: list) -> list:
             "installed_version": _text(vulnerability.get("installed_version")),
             "recommended_version": recommended,
             "recommendation": recommendation,
+            **risk,
         })
     return findings
