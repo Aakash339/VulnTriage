@@ -87,7 +87,7 @@ class DashboardFindingTests(unittest.TestCase):
         self.assertIn("not prove", explanation)
         self.assertIn("safe", explanation)
         limitations = _reachability_limitations().casefold()
-        for limitation in ("dynamic loading", "reflection", "plugins", "transitive"):
+        for limitation in ("dynamic loading", "reflection", "plugins", "transitive", "curated", "ambiguous", "unknown"):
             self.assertIn(limitation, limitations)
 
     def test_summary_uses_findings(self):

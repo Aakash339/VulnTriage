@@ -6,7 +6,7 @@ from typing import TypedDict, Literal
 class Dependency(TypedDict):
     name: str
     version: str
-    ecosystem: Literal["PyPI", "npm"]
+    ecosystem: Literal["PyPI", "npm", "Maven"]
     source_file: str
 
 

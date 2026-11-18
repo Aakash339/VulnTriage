@@ -283,7 +283,8 @@ def _reachability_explanation(status: str) -> str:
 def _reachability_limitations() -> str:
     return (
         "Static analysis may miss dynamic loading, reflection, plugins, and indirect or transitive use. "
-        "NOT_FOUND is not proof that a dependency is unused or safe."
+        "Java results use curated Maven-coordinate to package-prefix mappings; unmapped or ambiguous "
+        "mappings are UNKNOWN. UNKNOWN and NOT_FOUND do not prove that a dependency is unused or safe."
     )
 
 

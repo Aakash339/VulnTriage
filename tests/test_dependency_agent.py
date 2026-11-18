@@ -174,6 +174,92 @@ class DependencyAgentTests(unittest.TestCase):
         self.put("requirements.txt", "foo>=1,<3\n")
         self.assertEqual(self.deps("PyPI")[0]["version"], "<3,>=1")
 
+    # Maven and Gradle dependency extraction
+    def test_36_namespaced_pom_and_property_resolution(self):
+        self.put("pom.xml", """<project xmlns="http://maven.apache.org/POM/4.0.0">
+          <modelVersion>4.0.0</modelVersion><properties><spring.version>6.1.2</spring.version></properties>
+          <dependencies><dependency><groupId>org.springframework</groupId><artifactId>spring-core</artifactId><version>${spring.version}</version></dependency></dependencies>
+        </project>""")
+        self.assertEqual(self.deps("Maven"), [{"name": "org.springframework:spring-core", "version": "6.1.2", "ecosystem": "Maven", "source_file": "pom.xml"}])
+
+    def test_37_dependency_management_applies_only_to_declared_dependencies(self):
+        self.put("pom.xml", """<project><dependencyManagement><dependencies>
+          <dependency><groupId>org.example</groupId><artifactId>managed</artifactId><version>2.0</version></dependency>
+          <dependency><groupId>org.example</groupId><artifactId>unused</artifactId><version>3.0</version></dependency>
+        </dependencies></dependencyManagement><dependencies>
+          <dependency><groupId>org.example</groupId><artifactId>managed</artifactId></dependency>
+        </dependencies></project>""")
+        self.assertEqual([(d["name"], d["version"]) for d in self.deps("Maven")], [("org.example:managed", "2.0")])
+
+    def test_38_unresolved_pom_property_is_not_invented(self):
+        self.put("pom.xml", "<project><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>${missing.version}</version></dependency></dependencies></project>")
+        self.assertEqual(self.deps("Maven")[0]["version"], "${missing.version}")
+
+    def test_39_pom_duplicate_coordinates_and_scope_policy(self):
+        self.put("pom.xml", """<project><dependencies>
+          <dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version><scope>test</scope></dependency>
+          <dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version><scope>provided</scope></dependency>
+          <dependency><groupId>g</groupId><artifactId>b</artifactId><version>2</version><scope>provided</scope></dependency>
+        </dependencies></project>""")
+        self.assertEqual({d["name"] for d in self.deps("Maven")}, {"g:a", "g:b"})
+
+    def test_40_malformed_pom_is_ignored(self):
+        self.put("pom.xml", "<project><dependencies>")
+        self.assertEqual(self.deps("Maven"), [])
+
+    def test_41_gradle_groovy_declarations_and_configurations(self):
+        self.put("build.gradle", """dependencies {
+          implementation 'g:impl:1.0'
+          api("g:api:2.0")
+          runtimeOnly 'g:runtime:3.0'
+          compileOnly("g:compile:4.0")
+          // implementation 'g:commented:1'
+        }
+        """)
+        self.assertEqual({(d["name"], d["version"]) for d in self.deps("Maven")}, {
+            ("g:impl", "1.0"), ("g:api", "2.0"), ("g:runtime", "3.0"), ("g:compile", "4.0")
+        })
+
+    def test_42_gradle_kotlin_declarations(self):
+        self.put("build.gradle.kts", """dependencies {
+          implementation("g:impl:1.0")
+          api('g:api:2.0')
+          compileOnly("g:compile:3.0")
+        }
+        """)
+        self.assertEqual({d["name"] for d in self.deps("Maven")}, {"g:impl", "g:api", "g:compile"})
+
+    def test_43_gradle_variable_and_dynamic_versions_are_conservative(self):
+        self.put("build.gradle", """dependencies {
+          implementation 'g:dynamic:1.+'
+          implementation "g:property:${version}"
+          implementation libs.catalogEntry
+        }
+        """)
+        self.assertEqual({(d["name"], d["version"]) for d in self.deps("Maven")}, {
+            ("g:dynamic", "1.+"), ("g:property", "${version}")
+        })
+
+    def test_44_gradle_lockfile_includes_transitive_and_overrides_declaration(self):
+        self.put("build.gradle", "dependencies {\n implementation 'g:direct:1.0'\n}\n")
+        self.put("gradle.lockfile", "g:direct:1.2=compileClasspath,runtimeClasspath\ng:transitive:4.0=runtimeClasspath\n")
+        result = self.deps("Maven")
+        self.assertEqual({(d["name"], d["version"]) for d in result}, {("g:direct", "1.2"), ("g:transitive", "4.0")})
+        self.assertTrue(all(d["source_file"] == "gradle.lockfile" for d in result))
+
+    def test_45_mixed_python_npm_and_maven_project(self):
+        self.put("requirements.txt", "requests==2.0\n")
+        self.package({"dependencies": {"left-pad": "1.0"}})
+        self.put("pom.xml", "<project><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version></dependency></dependencies></project>")
+        self.assertEqual({d["ecosystem"] for d in self.deps()}, {"PyPI", "npm", "Maven"})
+
+    def test_46_overlapping_maven_manifests_deduplicate_coordinate_version(self):
+        self.put("pom.xml", "<project><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version></dependency></dependencies></project>")
+        self.put("build.gradle", "dependencies {\n implementation 'g:a:1'\n}\n")
+        result = self.deps("Maven")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "g:a")
+
 
 if __name__ == "__main__":
     unittest.main()

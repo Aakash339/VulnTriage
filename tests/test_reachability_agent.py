@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from agents import reachability_agent
 from agents.reachability_agent import check_reachability
 
 
@@ -142,6 +144,134 @@ class ReachabilityAgentTests(unittest.TestCase):
             {"package": "requests"}, {"package": "Requests"}, {"package": "other"},
         ])
         self.assertEqual([item["package"] for item in results], ["requests", "other"])
+
+    def test_java_regular_wildcard_and_static_imports_include_precise_evidence(self):
+        self.write(
+            "src/Main.java",
+            "import com.google.common.collect.ImmutableList;\n"
+            "import org.apache.commons.lang3.*;\n"
+            "import static com.fasterxml.jackson.databind.ObjectMapper.builder;\n",
+        )
+        results = check_reachability(str(self.root), [
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+            {"package": "org.apache.commons:commons-lang3", "ecosystem": "Maven"},
+            {"package": "com.fasterxml.jackson.core:jackson-databind", "ecosystem": "Maven"},
+        ])
+        by_package = {item["package"]: item for item in results}
+        expected = {
+            "com.google.guava:guava": "src/Main.java:1: import com.google.common.collect.ImmutableList;",
+            "org.apache.commons:commons-lang3": "src/Main.java:2: import org.apache.commons.lang3.*;",
+            "com.fasterxml.jackson.core:jackson-databind": "src/Main.java:3: import static com.fasterxml.jackson.databind.ObjectMapper.builder;",
+        }
+        for package, evidence in expected.items():
+            with self.subTest(package=package):
+                self.assertEqual(by_package[package]["status"], "USED")
+                self.assertIn(evidence, by_package[package]["evidence"])
+
+    def test_every_curated_maven_mapping_is_covered(self):
+        for coordinate, prefixes in reachability_agent._MAVEN_PACKAGE_PREFIXES.items():
+            with self.subTest(coordinate=coordinate):
+                self.write("Mapped.java", f"import {prefixes[0]}.ExampleType;\n")
+                result = check_reachability(str(self.root), [
+                    {"package": coordinate, "ecosystem": "Maven"},
+                ])[0]
+                self.assertEqual(result["status"], "USED")
+
+    def test_known_maven_mapping_without_import_is_not_found(self):
+        self.write("Main.java", "package demo;\nclass Main {}\n")
+        result = check_reachability(str(self.root), [
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+        ])[0]
+        self.assertEqual(result["status"], "NOT_FOUND")
+        self.assertEqual(result["evidence"], [])
+
+    def test_java_package_prefix_requires_a_component_boundary(self):
+        self.write("Main.java", "import com.google.commonish.collect.OtherType;\n")
+        result = check_reachability(str(self.root), [
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+        ])[0]
+        self.assertEqual(result["status"], "NOT_FOUND")
+
+    def test_unmapped_and_ambiguous_maven_coordinates_are_unknown(self):
+        self.write("Main.java", "import com.google.common.collect.ImmutableList;\n")
+        unmapped = check_reachability(str(self.root), [
+            {"package": "not.in.map:artifact", "ecosystem": "Maven"},
+        ])[0]
+        self.assertEqual(unmapped["status"], "UNKNOWN")
+
+        with patch.dict(reachability_agent._MAVEN_PACKAGE_PREFIXES, {
+            "com.other:guava-copy": ("com.google.common",),
+        }):
+            ambiguous = check_reachability(str(self.root), [
+                {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+                {"package": "com.other:guava-copy", "ecosystem": "Maven"},
+            ])
+        self.assertEqual([item["status"] for item in ambiguous], ["UNKNOWN", "UNKNOWN"])
+
+    def test_maven_reachability_is_unknown_without_java_source(self):
+        self.write("main.py", "import requests\n")
+        self.write("app.js", "import lodash from 'lodash';\n")
+        results = check_reachability(str(self.root), [
+            {"package": "requests", "ecosystem": "PyPI"},
+            {"package": "lodash", "ecosystem": "npm"},
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+        ])
+        by_package = {item["package"]: item for item in results}
+        self.assertEqual(by_package["requests"]["status"], "USED")
+        self.assertEqual(by_package["lodash"]["status"], "USED")
+        self.assertEqual(by_package["com.google.guava:guava"]["status"], "UNKNOWN")
+
+    def test_unsupported_java_import_syntax_is_unknown(self):
+        self.write("Main.java", "import com.google.common..Broken;\n")
+        result = check_reachability(str(self.root), [
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+        ])[0]
+        self.assertEqual(result["status"], "UNKNOWN")
+
+    def test_java_comments_strings_and_text_blocks_are_not_import_evidence(self):
+        self.write(
+            "Main.java",
+            "// import com.google.common.collect.CommentType;\n"
+            "/* import com.google.common.collect.BlockType; */\n"
+            'String example = "import com.google.common.collect.StringType;";\n'
+            'String text = """\nimport com.google.common.collect.TextBlockType;\n""";\n',
+        )
+        result = check_reachability(str(self.root), [
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+        ])[0]
+        self.assertEqual(result["status"], "NOT_FOUND")
+        self.assertEqual(result["evidence"], [])
+
+    def test_java_scan_error_preserves_positive_evidence(self):
+        self.write("broken.java", "/* unterminated comment\n")
+        self.write("src/Good.java", "import com.google.common.collect.ImmutableList;\n")
+        results = check_reachability(str(self.root), [
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+            {"package": "org.apache.commons:commons-lang3", "ecosystem": "Maven"},
+        ])
+        by_package = {item["package"]: item for item in results}
+        self.assertEqual(by_package["com.google.guava:guava"]["status"], "USED")
+        self.assertIn(
+            "src/Good.java:1: import com.google.common.collect.ImmutableList;",
+            by_package["com.google.guava:guava"]["evidence"],
+        )
+        self.assertEqual(by_package["org.apache.commons:commons-lang3"]["status"], "UNKNOWN")
+
+    def test_mixed_python_npm_and_maven_and_duplicate_maven_records(self):
+        self.write("main.py", "import requests\n")
+        self.write("app.js", "import lodash from 'lodash';\n")
+        self.write("Main.java", "import com.google.common.collect.ImmutableList;\n")
+        results = check_reachability(str(self.root), [
+            {"package": "requests", "ecosystem": "PyPI"},
+            {"package": "lodash", "ecosystem": "npm"},
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+        ])
+        by_package = {item["package"]: item for item in results}
+        self.assertEqual(len(results), 3)
+        self.assertEqual(by_package["requests"]["status"], "USED")
+        self.assertEqual(by_package["lodash"]["status"], "USED")
+        self.assertEqual(by_package["com.google.guava:guava"]["status"], "USED")
 
 
 if __name__ == "__main__":
