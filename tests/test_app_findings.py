@@ -4,6 +4,7 @@ import io
 from collections import Counter
 
 from app import (
+    NAVIGATION_ITEMS,
     SORT_OPTIONS,
     _filter_findings,
     _finding_summary,
@@ -11,6 +12,7 @@ from app import (
     _queue_filter_defaults,
     _risk_analysis_summary,
     _sort_findings,
+    _navigation_section,
 )
 from reports.report_generator import generate_csv_report
 
@@ -60,6 +62,23 @@ class DashboardFindingTests(unittest.TestCase):
                                             {"CRITICAL", "LOW", "MEDIUM", "UNKNOWN"}, "All")
         self.assertEqual(len(all_reachability), len(self.findings))
         self.assertEqual(len(self.findings), 5)
+
+    def test_search_filters_by_package_or_vulnerability_id(self):
+        self.assertEqual(
+            [row["vulnerability_id"] for row in _filter_findings(self.findings, set(), set(), "All", "B-2")],
+            ["B-2"],
+        )
+        self.assertEqual(
+            [row["package"] for row in _filter_findings(self.findings, set(), set(), "All", "ALPHA")],
+            ["alpha", "alpha"],
+        )
+        combined = _filter_findings(self.findings, {"HIGH"}, set(), "All", "B-2")
+        self.assertEqual([row["vulnerability_id"] for row in combined], ["B-2"])
+
+    def test_navigation_has_four_main_workspaces_and_safe_fallback(self):
+        self.assertEqual([key for key, _ in NAVIGATION_ITEMS], ["overview", "investigation", "intelligence", "reports"])
+        self.assertEqual(_navigation_section("intelligence"), "intelligence")
+        self.assertEqual(_navigation_section("unknown"), "overview")
 
     def test_summary_uses_findings(self):
         self.assertEqual(_finding_summary(self.findings), {

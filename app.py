@@ -33,6 +33,12 @@ SORT_OPTIONS = (
     "Reachability (USED first)",
     "Vulnerability ID (A–Z)",
 )
+NAVIGATION_ITEMS = (
+    ("overview", "◉  Overview"),
+    ("investigation", "⚠  Investigation"),
+    ("intelligence", "⌁  Intelligence & Analytics"),
+    ("reports", "⇩  Reports"),
+)
 
 
 class ArchiveValidationError(ValueError):
@@ -196,11 +202,14 @@ def _sort_findings(findings: list, sort_option: str = SORT_OPTIONS[0]) -> list:
     return sorted(rows, key=key)
 
 
-def _filter_findings(findings: list, severities: set[str], priorities: set[str], reachability: str) -> list:
-    """Filter a copy; empty severity or priority selections mean no restriction."""
+def _filter_findings(
+    findings: list, severities: set[str], priorities: set[str], reachability: str, search: str = "",
+) -> list:
+    """Filter a copy; blank search or empty severity/priority selections add no restriction."""
     selected_severities = {value.strip().upper() for value in (severities or set()) if isinstance(value, str) and value.strip()}
     selected_priorities = {value.strip().upper() for value in (priorities or set()) if isinstance(value, str) and value.strip()}
     selected_reachability = reachability.strip().upper() if isinstance(reachability, str) else "ALL"
+    query = search.strip().casefold() if isinstance(search, str) else ""
     filtered = []
     for finding in findings:
         severity = _normal_severity(finding)
@@ -216,6 +225,11 @@ def _filter_findings(findings: list, severities: set[str], priorities: set[str],
             continue
         if selected_reachability != "ALL" and reach != selected_reachability:
             continue
+        if query and not any(query in _field_text(finding, field, "").casefold() for field in (
+            "package", "vulnerability_id", "installed_version", "recommended_version",
+            "severity", "priority", "reachability", "recommendation",
+        )):
+            continue
         filtered.append(finding)
     return filtered
 
@@ -230,6 +244,7 @@ def _queue_filter_defaults(findings: list) -> dict[str, object]:
         }),
         "soc-reachability": "All",
         "soc-sort": SORT_OPTIONS[0],
+        "soc-search": "",
     }
 
 
@@ -239,9 +254,12 @@ def _reset_queue_filters() -> None:
         st.session_state[key] = value
 
 
-def _prepare_queue(findings: list, severities: set[str], priorities: set[str], reachability: str, sort_option: str) -> list:
+def _prepare_queue(
+    findings: list, severities: set[str], priorities: set[str], reachability: str,
+    sort_option: str, search: str = "",
+) -> list:
     """Apply filters and sort without mutating or losing any source findings."""
-    return _sort_findings(_filter_findings(findings, severities, priorities, reachability), sort_option)
+    return _sort_findings(_filter_findings(findings, severities, priorities, reachability, search), sort_option)
 
 
 def _reachability_counts(findings: list) -> dict[str, int]:
@@ -260,6 +278,111 @@ def _risk_analysis_summary(findings: list) -> dict[str, object]:
         "highest": max(scores) if scores else None,
         "unknown_severity": sum(_normal_severity(finding) == "UNKNOWN" for finding in findings),
         "reachability": reachability,
+    }
+
+
+def _security_analytics(findings: list, vulnerabilities: list) -> dict[str, object]:
+    """Build scan-grounded analytics without consulting queue widget state."""
+    severity_order = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
+    risk_order = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
+    severity_rank = {value: index for index, value in enumerate(severity_order)}
+    priority_rank = dict(PRIORITY_ORDER)
+    severity = {value: 0 for value in severity_order}
+    risk_level = {value: 0 for value in risk_order}
+    reachability = {"USED": 0, "NOT_FOUND": 0, "UNKNOWN": 0}
+    scores = []
+    packages: dict[str, dict[str, object]] = {}
+
+    for finding in findings if isinstance(findings, list) else []:
+        if not isinstance(finding, dict):
+            continue
+        finding_severity = _normal_severity(finding)
+        severity[finding_severity] += 1
+        level = _field_text(finding, "risk_level").upper()
+        risk_level[level if level in risk_level else "UNKNOWN"] += 1
+        reach = _field_text(finding, "reachability").upper()
+        reachability[reach if reach in reachability else "UNKNOWN"] += 1
+        score = _risk_score(finding)
+        if score is not None:
+            scores.append(score)
+
+        package_name = _field_text(finding, "package", "").strip()
+        if not package_name:
+            continue
+        package_key = package_name.casefold()
+        entry = packages.setdefault(package_key, {
+            "package": package_name, "vulnerability_count": 0,
+            "highest_risk_score": None, "highest_severity": "UNKNOWN",
+            "remediation_priority": "UNKNOWN",
+        })
+        entry["vulnerability_count"] += 1
+        if score is not None and (entry["highest_risk_score"] is None or score > entry["highest_risk_score"]):
+            entry["highest_risk_score"] = score
+        if severity_rank[finding_severity] < severity_rank[entry["highest_severity"]]:
+            entry["highest_severity"] = finding_severity
+        priority = _field_text(finding, "priority").upper()
+        if priority not in priority_rank:
+            priority = "UNKNOWN"
+        if priority_rank[priority] < priority_rank[entry["remediation_priority"]]:
+            entry["remediation_priority"] = priority
+
+    package_ranking = sorted(
+        packages.values(),
+        key=lambda row: (-row["vulnerability_count"],
+                         -(row["highest_risk_score"] if row["highest_risk_score"] is not None else -1),
+                         row["package"].casefold()),
+    )
+    highest_priority = sorted(
+        [finding for finding in findings if isinstance(finding, dict)] if isinstance(findings, list) else [],
+        key=lambda row: (
+            -(_risk_score(row) if _risk_score(row) is not None else -1),
+            _priority_rank(row), _severity_rank(row),
+            _field_text(row, "package", "").casefold(),
+            _field_text(row, "vulnerability_id", "").casefold(),
+        ),
+    )[:5]
+
+    ecosystem_counts: dict[str, int] = {}
+    for vulnerability in vulnerabilities if isinstance(vulnerabilities, list) else []:
+        if not isinstance(vulnerability, dict):
+            continue
+        ecosystem = _field_text(vulnerability, "ecosystem", "UNKNOWN").strip() or "UNKNOWN"
+        ecosystem_counts[ecosystem] = ecosystem_counts.get(ecosystem, 0) + 1
+    fixed_count = sum(
+        isinstance(record, dict) and isinstance(record.get("fixed_versions"), (list, tuple))
+        and any(isinstance(version, str) and version.strip() for version in record["fixed_versions"])
+        for record in (vulnerabilities if isinstance(vulnerabilities, list) else [])
+    )
+
+    observations = []
+    valid_findings = [finding for finding in findings if isinstance(finding, dict)] if isinstance(findings, list) else []
+    if not valid_findings:
+        observations.append("No vulnerability findings were returned in this scan.")
+    else:
+        lead_severity = min(severity_order, key=lambda value: (-severity[value], severity_rank[value]))
+        observations.append(f"{lead_severity.title()} is the largest severity category ({severity[lead_severity]} of {len(valid_findings)} findings).")
+        if scores:
+            observations.append(f"The highest recorded risk score is {max(scores):g}/100.")
+        if reachability["UNKNOWN"]:
+            observations.append(f"{reachability['UNKNOWN']} findings have unknown reachability and may need source-level review.")
+        if package_ranking:
+            observations.append(f"{package_ranking[0]['package']} has the most findings ({package_ranking[0]['vulnerability_count']}).")
+        if fixed_count:
+            observations.append(f"OSV reports fixed versions for {fixed_count} vulnerability record(s).")
+
+    return {
+        "total_findings": len(valid_findings),
+        "severity_distribution": severity,
+        "risk_level_distribution": risk_level,
+        "average_risk_score": sum(scores) / len(scores) if scores else None,
+        "maximum_risk_score": max(scores) if scores else None,
+        "minimum_risk_score": min(scores) if scores else None,
+        "package_ranking": package_ranking[:5],
+        "reachability_breakdown": reachability,
+        "ecosystem_distribution": dict(sorted(ecosystem_counts.items(), key=lambda item: item[0].casefold())),
+        "findings_with_fixed_versions": fixed_count,
+        "highest_priority_targets": highest_priority,
+        "observations": observations,
     }
 
 
@@ -317,16 +440,11 @@ def _render_theme() -> None:
     [data-testid="stCaptionContainer"] { font-size:.9rem; }
     .soc-brand { color:#f3f8fc; font-size:1.35rem; font-weight:760; letter-spacing:.02em; }
     .soc-subbrand { color:#a9bac9; font-size:.82rem; letter-spacing:.1em; text-transform:uppercase; margin-top:.25rem; }
-    .soc-nav-link { display:flex; align-items:center; gap:.7rem; margin:.28rem 0; padding:.68rem .7rem;
-       color:#c6d3de !important; text-decoration:none !important; font-size:.98rem; font-weight:560;
-       border:1px solid transparent; border-radius:8px; transition:background-color .12s ease; }
-    .soc-nav-icon { color:#77a0b7; width:1.25rem; text-align:center; font-size:1.05rem; }
-    .soc-nav-link:hover, .soc-nav-link:focus-visible { background:#13283a; border-color:#29465c; color:#f2f7fb !important; }
-    body:has(#security-overview:target) a[href="#security-overview"],
-    body:has(#vulnerability-findings:target) a[href="#vulnerability-findings"],
-    body:has(#dependency-inventory:target) a[href="#dependency-inventory"],
-    body:has(#risk-analysis:target) a[href="#risk-analysis"],
-    body:has(#scan-reports:target) a[href="#scan-reports"] { background:#142b3d; border-color:#2a4a60; color:#f4f9fc !important; }
+    .stSidebar [data-testid="stRadio"] label { padding:.62rem .7rem; margin:.2rem 0; border:1px solid transparent;
+       border-radius:8px; color:#c6d3de; font-weight:620; }
+    .stSidebar [data-testid="stRadio"] label:hover { background:#13283a; border-color:#29465c; }
+    .stSidebar [data-testid="stRadio"] label:has(input:checked) { background:#142b3d; border-color:#2a4a60; color:#54ddeb; }
+    .stSidebar [data-testid="stRadio"] label p { font-size:.96rem; }
     .soc-topbar { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:.9rem 1.1rem;
        border:1px solid var(--line); border-radius:12px; background:linear-gradient(110deg,#0d1b2a,#0b1926); margin:.5rem 0 1.1rem; }
     .soc-system { font-weight:700; color:#eaf4fb; letter-spacing:.02em; }
@@ -345,7 +463,7 @@ def _render_theme() -> None:
     .marker-failed { color:#fff; background:var(--critical); border-color:var(--critical); }
     .soc-stage-state { color:#b0bfcd; font-size:.82rem; text-transform:uppercase; letter-spacing:.06em; }
     .state-completed { color:var(--green); } .state-running { color:var(--cyan); } .state-failed { color:#ff7584; }
-    .soc-card-grid { display:grid; grid-template-columns:repeat(6,minmax(110px,1fr)); gap:.7rem; margin:.8rem 0 1rem; }
+    .soc-card-grid { display:grid; grid-template-columns:repeat(3,minmax(150px,1fr)); gap:.7rem; margin:.8rem 0 1rem; }
     .soc-card { background:linear-gradient(145deg,#112538,#0b1926); border:1px solid #2a4154; border-top:3px solid var(--accent);
        border-radius:10px; padding:.95rem 1rem; min-height:102px; box-shadow:0 4px 14px #00000018; }
     .soc-card-label { font-size:.82rem; line-height:1.3; text-transform:uppercase; color:#c2cfda; letter-spacing:.075em; font-weight:650; }
@@ -384,28 +502,22 @@ def _render_theme() -> None:
     """, unsafe_allow_html=True)
 
 
-def _render_sidebar() -> None:
+def _render_sidebar() -> str:
     with st.sidebar:
         st.markdown('<div class="soc-brand">🛡️ VulnTriage</div><div class="soc-subbrand">Security Operations</div>', unsafe_allow_html=True)
         st.markdown("---")
-        st.caption("NAVIGATION")
-        for icon, label, anchor in (
-            ("⌂", "Security Overview", "security-overview"),
-            ("⚠", "Vulnerability Findings", "vulnerability-findings"),
-            ("▤", "Dependency Inventory", "dependency-inventory"),
-            ("◉", "Risk Analysis", "risk-analysis"),
-            ("⇩", "Scan Reports", "scan-reports"),
-        ):
-            st.markdown(
-                f'<a class="soc-nav-link" href="#{anchor}"><span class="soc-nav-icon">{icon}</span>{label}</a>',
-                unsafe_allow_html=True,
-            )
+        st.caption("WORKSPACE")
+        labels = {key: label for key, label in NAVIGATION_ITEMS}
+        selected = st.radio(
+            "Workspace", options=tuple(labels), format_func=lambda key: labels[key],
+            key="soc-navigation", label_visibility="collapsed",
+        )
         st.markdown("---")
         st.caption("LOCAL ANALYSIS · OSV INTELLIGENCE")
+        return selected
 
 
-def _render_topbar(scan_status: str, project_name: str, total: int | None, container=None) -> None:
-    total_label = str(total) if total is not None else "—"
+def _render_topbar(scan_status: str, project_name: str, container=None) -> None:
     safe_project = html.escape(project_name or "No project uploaded")
     safe_status = html.escape(scan_status.upper())
     markup = (
@@ -413,7 +525,6 @@ def _render_topbar(scan_status: str, project_name: str, total: int | None, conta
         '<div><div class="soc-system">VulnTriage Security Operations</div>'
         f'<div class="soc-meta">Project · {safe_project}</div></div>'
         f'<div class="soc-meta">Scan status · <b>{safe_status}</b></div>'
-        f'<div class="soc-meta">Vulnerabilities · <b>{total_label}</b></div>'
         '<div class="soc-status"><span class="soc-dot"></span>ENGINE READY</div>'
         '</div>'
     )
@@ -465,8 +576,9 @@ def _render_severity_chart(findings: list[dict]) -> None:
 
 
 def _render_queue(findings: list[dict], vulnerability_records: list[dict], reachability_records: list[dict], scan_completed: bool) -> None:
-    st.markdown('<div id="vulnerability-findings"></div><div class="soc-section-kicker">05 / Investigation queue</div>', unsafe_allow_html=True)
-    st.header("Priority Investigation Queue")
+    st.markdown('<div class="soc-section-kicker">02 / Investigation</div>', unsafe_allow_html=True)
+    st.title("Vulnerability Investigation")
+    st.subheader("Priority queue")
     st.caption("Risk score is a deterministic triage heuristic. Filtered rows affect the queue and details; the report retains every finding.")
     severities = sorted({_normal_severity(item) for item in findings})
     finding_priorities = sorted({_field_text(item, "priority").upper() for item in findings})
@@ -475,9 +587,11 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
     selected_severities = controls[1].multiselect("Severity", severities, default=severities, key="soc-severity")
     selected_priorities = controls[2].multiselect("Priority", finding_priorities, default=finding_priorities, key="soc-priority")
     selected_reach = controls[3].selectbox("Reachability", ["All", "USED", "NOT_FOUND", "UNKNOWN"], key="soc-reachability")
-    st.button("Reset filters", key="soc-reset-filters", on_click=_reset_queue_filters, help="Restore the full finding set.")
+    search_col, reset_col = st.columns([3, 1])
+    search = search_col.text_input("Search findings", placeholder="Search package, CVE / OSV ID, version or recommendation", key="soc-search")
+    reset_col.button("Reset filters", key="soc-reset-filters", on_click=_reset_queue_filters, help="Restore the full finding set.", use_container_width=True)
     sorted_findings = _prepare_queue(
-        findings, set(selected_severities), set(selected_priorities), selected_reach, sort_option
+        findings, set(selected_severities), set(selected_priorities), selected_reach, sort_option, search
     )
 
     if not scan_completed:
@@ -514,8 +628,7 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="soc-section-kicker" style="margin-top:1.4rem">06 / Finding details</div>', unsafe_allow_html=True)
-    st.subheader("Vulnerability Investigation")
+    st.subheader("Finding details")
     vuln_by_key = {
         (_field_text(record, "package", "").casefold(), _field_text(record, "vulnerability_id", "").casefold()): record
         for record in vulnerability_records if isinstance(record, dict)
@@ -569,84 +682,169 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
                         right.write(reference)
 
 
-def _render_metrics(findings: list[dict], scan_completed: bool) -> None:
-    severities = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
-    colors = {"CRITICAL": "#ff5265", "HIGH": "#ff9a45", "MEDIUM": "#f4d35e", "LOW": "#45d483", "UNKNOWN": "#8b98a7"}
-    counts = {severity: sum(_normal_severity(item) == severity for item in findings) for severity in severities}
+def _render_metrics(findings: list[dict], dependencies: list, scan_completed: bool) -> None:
+    vulnerable_packages = len({
+        _field_text(item, "package", "").casefold()
+        for item in findings if isinstance(item, dict) and _field_text(item, "package", "")
+    })
+    dependency_count = len({
+        (_field_text(item, "ecosystem", "UNKNOWN").casefold(), _field_text(item, "name", "").casefold())
+        for item in dependencies if isinstance(item, dict) and _field_text(item, "name", "")
+    }) if isinstance(dependencies, list) else 0
     cards = []
-    for severity in ("TOTAL",) + severities:
-        count = (len(findings) if severity == "TOTAL" else counts[severity]) if scan_completed else "—"
-        color = "#48d8e8" if severity == "TOTAL" else colors[severity]
-        label = "TOTAL VULNERABILITIES" if severity == "TOTAL" else severity
+    for label, value, color in (
+        ("TOTAL VULNERABILITIES", len(findings) if scan_completed else "—", "#48d8e8"),
+        ("AFFECTED PACKAGES", vulnerable_packages if scan_completed else "—", "#ff9a45"),
+        ("DEPENDENCIES ANALYZED", dependency_count if scan_completed else "—", "#45d483"),
+    ):
         cards.append(
             f'<div class="soc-card" style="--accent:{color}"><div class="soc-card-label">{label}</div>'
-            f'<div class="soc-card-value">{count}</div></div>'
+            f'<div class="soc-card-value">{value}</div></div>'
         )
     st.markdown('<div class="soc-card-grid">' + "".join(cards) + "</div>", unsafe_allow_html=True)
 
 
 def _render_overview(
-    findings: list[dict], statuses: dict[str, str], scan_completed: bool,
-    live_pipeline_displayed: bool,
+    findings: list[dict], dependencies: list, statuses: dict[str, str], scan_completed: bool,
+    live_pipeline_displayed: bool = False,
 ) -> None:
-    st.markdown('<div id="security-overview"></div><div class="soc-section-kicker">01 / Security overview</div>', unsafe_allow_html=True)
-    st.header("Threat Overview")
-    _render_metrics(findings, scan_completed)
+    st.markdown('<div class="soc-section-kicker">01 / Overview</div>', unsafe_allow_html=True)
+    st.title("Security Overview")
+    st.caption("Current scan status, project exposure summary, and the actual analysis pipeline state.")
+    _render_metrics(findings, dependencies, scan_completed)
     if live_pipeline_displayed:
         with st.container(border=True):
-            st.markdown('<div class="soc-section-kicker">03 / Threat intelligence</div>', unsafe_allow_html=True)
-            st.subheader("Severity Distribution")
+            st.subheader("Severity overview · OSV")
             if scan_completed:
                 _render_severity_chart(findings)
             else:
-                st.info("Distribution is available after the first completed scan.")
+                st.info("Severity distribution appears after a completed scan.")
     else:
         left, right = st.columns([1.05, 1])
-        with left:
-            with st.container(border=True):
-                st.markdown('<div class="soc-section-kicker">02 / Scan activity</div>', unsafe_allow_html=True)
-                st.subheader("Investigation Pipeline")
-                _render_pipeline(statuses)
-        with right:
-            with st.container(border=True):
-                st.markdown('<div class="soc-section-kicker">03 / Threat intelligence</div>', unsafe_allow_html=True)
-                st.subheader("Severity Distribution")
-                if scan_completed:
-                    _render_severity_chart(findings)
-                else:
-                    st.info("Distribution is available after the first completed scan.")
-    risk_scores = [score for item in findings if (score := _risk_score(item)) is not None]
-    used = sum(_field_text(item, "reachability").upper() == "USED" for item in findings)
-    unknown = sum(_field_text(item, "reachability").upper() == "UNKNOWN" for item in findings)
-    risk_columns = st.columns(4)
-    unique_packages = len({_field_text(item, "package", "").casefold() for item in findings if _field_text(item, "package", "")})
-    risk_columns[0].metric("Affected packages", unique_packages if scan_completed else "—")
-    risk_columns[1].metric("Mean risk score", f"{sum(risk_scores) / len(risk_scores):.1f}" if risk_scores else "—")
-    risk_columns[2].metric("Imports detected", used if scan_completed else "—")
-    risk_columns[3].metric("Reachability unknown", unknown if scan_completed else "—")
+        with left, st.container(border=True):
+            st.subheader("Scan pipeline")
+            _render_pipeline(statuses)
+        with right, st.container(border=True):
+            st.subheader("Severity overview · OSV")
+            if scan_completed:
+                _render_severity_chart(findings)
+            else:
+                st.info("Severity distribution appears after a completed scan.")
 
 
 def _render_inventory(dependencies: list[dict], scan_completed: bool) -> None:
-    st.markdown('<div id="dependency-inventory"></div><div class="soc-section-kicker">04 / Dependency inventory</div>', unsafe_allow_html=True)
-    st.header("Dependency Inventory")
+    with st.expander("Dependency inventory", expanded=False):
+        if not scan_completed:
+            st.info("Dependency inventory will appear after scanning a project.")
+            return
+        if not dependencies:
+            st.info("No dependencies were returned by the supported manifest scanners for this project.")
+            return
+        st.caption(f"{len(dependencies)} dependency records extracted from supported manifest and lock files.")
+        rows = []
+        for dependency in dependencies:
+            if isinstance(dependency, dict):
+                rows.append({key: dependency.get(key, "") for key in ("name", "version", "ecosystem", "source_file")})
+        st.dataframe(rows, hide_index=True, use_container_width=True, height=min(440, 45 + 35 * len(rows)))
+
+
+def _render_analytics(findings: list, vulnerabilities: list, scan_completed: bool) -> None:
+    """Render dedicated scan analytics from unfiltered scan outputs."""
+    st.markdown('<div class="soc-section-kicker">03 / Intelligence & analytics</div>', unsafe_allow_html=True)
+    st.title("Security Intelligence & Analytics")
+    st.caption("Scan-wide patterns and prioritisation signals. Analytics always use the full scan, independent of investigation filters.")
     if not scan_completed:
-        st.info("Dependency inventory will appear after scanning a project.")
+        st.info("Security analytics will appear after a completed scan.")
         return
-    if not dependencies:
-        st.info("No dependencies were returned by the supported manifest scanners for this project.")
+    analytics = _security_analytics(findings, vulnerabilities)
+    if not analytics["total_findings"]:
+        st.info("The completed scan returned no vulnerability findings to analyse.")
+        for observation in analytics["observations"]:
+            st.markdown(f"- {observation}")
         return
-    st.caption(f"{len(dependencies)} dependency records extracted from supported manifests and lockfiles.")
-    rows = []
-    for dependency in dependencies:
-        if isinstance(dependency, dict):
-            rows.append({key: dependency.get(key, "") for key in ("name", "version", "ecosystem", "source_file")})
-    st.dataframe(rows, hide_index=True, use_container_width=True, height=min(440, 45 + 35 * len(rows)))
+
+    scores = st.columns(3)
+    for column, label, value in (
+        (scores[0], "Average risk score", analytics["average_risk_score"]),
+        (scores[1], "Maximum risk score", analytics["maximum_risk_score"]),
+        (scores[2], "Minimum risk score", analytics["minimum_risk_score"]),
+    ):
+        column.metric(label, f"{value:.1f}" if value is not None else "—")
+
+    st.caption(
+        "OSV severity describes the advisory’s reported impact level. VulnTriage risk scores and risk levels are separate triage outputs "
+        "that also consider reachability, fixed-version availability, and evidence confidence. A risk level is not an exploitability verdict."
+    )
+
+    left, right = st.columns([1.1, 1])
+    with left, st.container(border=True):
+        st.subheader("Risk score distribution · risk-level bands")
+        _render_distribution(analytics["risk_level_distribution"], ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"))
+        st.caption("The risk-level counts summarize the score bands once; see the mean, minimum, and maximum scores above.")
+    with right, st.container(border=True):
+        st.subheader("Reachability breakdown")
+        st.dataframe([{"Reachability": key, "Findings": value} for key, value in analytics["reachability_breakdown"].items()], hide_index=True, use_container_width=True)
+        st.subheader("Ecosystem distribution")
+        if analytics["ecosystem_distribution"]:
+            st.dataframe([{"Ecosystem": key, "Vulnerability records": value} for key, value in analytics["ecosystem_distribution"].items()], hide_index=True, use_container_width=True)
+        else:
+            st.caption("No ecosystem labels were returned by OSV for this scan.")
+        st.metric("Vulnerabilities with OSV fixed versions", analytics["findings_with_fixed_versions"])
+
+    tables = st.columns(2)
+    with tables[0]:
+        st.subheader("Top 5 Most Vulnerable Dependencies")
+        if analytics["package_ranking"]:
+            st.dataframe([
+                {
+                    "Package": row["package"],
+                    "Vulnerability count": row["vulnerability_count"],
+                    "Highest risk score": f"{row['highest_risk_score']:g}" if row["highest_risk_score"] is not None else "Unknown",
+                    "Highest severity": row["highest_severity"],
+                    "Remediation priority": row["remediation_priority"],
+                }
+                for row in analytics["package_ranking"]
+            ], hide_index=True, use_container_width=True)
+        else:
+            st.caption("No package names were available to rank.")
+
+    with tables[1]:
+        st.subheader("Highest-priority remediation targets")
+        st.dataframe([
+            {
+                "Package": _field_text(row, "package", ""),
+                "Vulnerability ID": _field_text(row, "vulnerability_id", "Unknown"),
+                "Risk score": _risk_score(row),
+                "Severity": _normal_severity(row),
+                "Priority": _field_text(row, "priority"),
+            }
+            for row in analytics["highest_priority_targets"]
+        ], hide_index=True, use_container_width=True)
+
+    st.subheader("Security observations")
+    for observation in analytics["observations"]:
+        st.markdown(f"- {observation}")
+    st.caption("Ecosystem and fixed-version analytics are counted from OSV vulnerability records. Import detection does not prove exploitability; NOT_FOUND does not establish safety.")
+
+
+def _render_distribution(counts: dict[str, int], order: tuple[str, ...]) -> None:
+    colors = {"CRITICAL": "#ff5265", "HIGH": "#ff9a45", "MEDIUM": "#f4d35e", "LOW": "#45d483", "UNKNOWN": "#8b98a7"}
+    peak = max(counts.values(), default=0) or 1
+    for label in order:
+        count = counts.get(label, 0)
+        width = round(100 * count / peak) if count else 0
+        color = colors.get(label, "#54ddeb")
+        st.markdown(
+            f'<div class="soc-bar-row"><span>{html.escape(label)}</span><div class="soc-bar-track">'
+            f'<div class="soc-bar-fill" style="width:{width}%;background:{color}"></div></div>'
+            f'<b>{count}</b></div>', unsafe_allow_html=True,
+        )
 
 
 def _render_reports(findings: list[dict], scan_completed: bool) -> None:
-    st.markdown('<div id="scan-reports"></div><div class="soc-section-kicker">07 / Reporting</div>', unsafe_allow_html=True)
-    st.header("Scan Reports")
-    st.caption("CSV contains all findings from this scan, regardless of queue filters or sort order.")
+    st.markdown('<div class="soc-section-kicker">04 / Reports</div>', unsafe_allow_html=True)
+    st.title("Scan Reports")
+    st.caption("Export the complete scan result as CSV. Queue filters and sorting do not affect the report.")
     if scan_completed:
         st.download_button(
             "⬇  Export complete CSV report",
@@ -658,6 +856,21 @@ def _render_reports(findings: list[dict], scan_completed: bool) -> None:
         )
     else:
         st.info("A complete CSV report will be available after a scan finishes.")
+
+
+def _remember_uploaded_project() -> None:
+    """Keep the selected ZIP available while the user visits other sections."""
+    uploaded = st.session_state.get("soc-upload-widget")
+    if uploaded is None:
+        st.session_state.pop("soc_uploaded_project", None)
+    else:
+        st.session_state["soc_uploaded_project"] = uploaded
+
+
+def _navigation_section(value: str) -> str:
+    """Return a supported workspace key, falling back safely to Overview."""
+    allowed = {key for key, _label in NAVIGATION_ITEMS}
+    return value if value in allowed else "overview"
 
 
 def _scan_with_progress(uploaded, upload_identity) -> None:
@@ -733,32 +946,46 @@ def _scan_with_progress(uploaded, upload_identity) -> None:
 def main() -> None:
     st.set_page_config(page_title="VulnTriage SOC", page_icon="🛡️", layout="wide")
     _render_theme()
-    _render_sidebar()
+    active_section = _navigation_section(_render_sidebar())
+    uploaded = st.session_state.get("soc_uploaded_project")
+    scan_button = False
 
-    st.markdown('<div class="soc-brand">VulnTriage</div><div class="soc-subbrand">Dependency Vulnerability Triage Agent</div>', unsafe_allow_html=True)
-    st.write("Security operations console for dependency exposure, reachability signals, and remediation triage.")
-    topbar_slot = st.empty()
-    uploaded = st.file_uploader(
-        "Load Python or npm project archive",
-        type=["zip"],
-        help="Supports requirements.txt and npm package.json/package-lock.json projects.",
-        label_visibility="collapsed",
-    )
-    upload_identity = (uploaded.name, uploaded.size) if uploaded is not None else None
-    if uploaded is not None and uploaded.size > MAX_UPLOAD_BYTES:
-        st.error("The ZIP exceeds the 100 MB upload limit. Please provide a smaller archive.")
-    scan_button = st.button(
-        "▶  Start Security Scan", type="primary",
-        disabled=(uploaded is None or uploaded.size > MAX_UPLOAD_BYTES),
-        use_container_width=False,
-    )
-    if scan_button and uploaded is not None:
-        st.session_state["soc_scan_status"] = "scanning"
-        st.session_state["soc_scan_project"] = uploaded.name
-        st.session_state["soc_scan_upload"] = upload_identity
-        _render_topbar("scanning", uploaded.name, None, topbar_slot)
-    if scan_button and uploaded is not None:
-        _scan_with_progress(uploaded, upload_identity)
+    if active_section == "overview":
+        st.markdown('<div class="soc-brand">VulnTriage</div><div class="soc-subbrand">Dependency Vulnerability Triage Agent</div>', unsafe_allow_html=True)
+        st.write("Security operations console for dependency exposure, reachability signals, and remediation triage.")
+        uploaded_from_widget = st.file_uploader(
+            "Load Python or npm project archive",
+            type=["zip"],
+            help="Supports requirements.txt and npm package.json/package-lock.json projects.",
+            key="soc-upload-widget",
+            on_change=_remember_uploaded_project,
+        )
+        if uploaded_from_widget is not None:
+            st.session_state["soc_uploaded_project"] = uploaded_from_widget
+        uploaded = st.session_state.get("soc_uploaded_project")
+        if uploaded is not None and uploaded_from_widget is None:
+            retained_col, clear_col = st.columns([3, 1])
+            retained_col.caption(f"Selected project retained for this session: **{html.escape(uploaded.name)}**")
+            if clear_col.button("Clear project", key="soc-clear-retained-upload"):
+                st.session_state.pop("soc_uploaded_project", None)
+                uploaded = None
+        upload_identity = (uploaded.name, uploaded.size) if uploaded is not None else None
+        if uploaded is not None and uploaded.size > MAX_UPLOAD_BYTES:
+            st.error("The ZIP exceeds the 100 MB upload limit. Please provide a smaller archive.")
+        scan_button = st.button(
+            "▶  Start Security Scan", type="primary",
+            disabled=(uploaded is None or uploaded.size > MAX_UPLOAD_BYTES),
+            use_container_width=False,
+        )
+        topbar_slot = st.empty()
+        if scan_button and uploaded is not None:
+            st.session_state["soc_scan_status"] = "scanning"
+            st.session_state["soc_scan_project"] = uploaded.name
+            st.session_state["soc_scan_upload"] = upload_identity
+            _render_topbar("scanning", uploaded.name, topbar_slot)
+            _scan_with_progress(uploaded, upload_identity)
+    else:
+        upload_identity = (uploaded.name, uploaded.size) if uploaded is not None else None
 
     matching_scan = (
         upload_identity is not None
@@ -769,14 +996,13 @@ def main() -> None:
     scan_status = st.session_state.get("soc_scan_status", "ready" if uploaded else "idle")
     if uploaded is not None and not matching_scan and st.session_state.get("soc_scan_upload") != upload_identity:
         scan_status = "ready"
-    total = len(findings) if matching_scan else None
-    _render_topbar(
-        scan_status,
-        uploaded.name if uploaded else st.session_state.get("soc_scan_project", ""),
-        total,
-        topbar_slot,
-    )
-    if st.session_state.get("vulntriage_error") and scan_status == "failed":
+    if active_section == "overview":
+        _render_topbar(
+            scan_status,
+            uploaded.name if uploaded else st.session_state.get("soc_scan_project", ""),
+            topbar_slot,
+        )
+    if st.session_state.get("vulntriage_error") and st.session_state.get("soc_scan_status") == "failed":
         st.error(st.session_state["vulntriage_error"])
 
     statuses = st.session_state.get("soc_pipeline_statuses", {stage: "pending" for stage, _ in _PIPELINE_STAGES})
@@ -787,41 +1013,17 @@ def main() -> None:
     vulnerabilities = data.get("vulnerabilities", []) if isinstance(data, dict) else []
     reachability = data.get("reachability", []) if isinstance(data, dict) else []
 
-    _render_overview(findings, statuses, matching_scan, scan_button)
-    if scan_status == "idle" and not matching_scan:
-        st.info("Upload a project ZIP and start a scan to populate the investigation console.")
-    _render_queue(findings, vulnerabilities, reachability, matching_scan)
-    _render_inventory(dependencies, matching_scan)
-    st.markdown('<div id="risk-analysis"></div><div class="soc-section-kicker">08 / Risk analysis</div>', unsafe_allow_html=True)
-    st.header("Risk Analysis")
-    if matching_scan and findings:
-        risk_summary = _risk_analysis_summary(findings)
-        analysis_columns = st.columns(5)
-        average = risk_summary["average"]
-        highest = risk_summary["highest"]
-        analysis_columns[0].metric("Average risk score", f"{average:.1f}" if average is not None else "—")
-        analysis_columns[1].metric("Highest risk score", f"{highest:.0f}" if highest is not None else "—")
-        analysis_columns[2].metric("Unknown Severity", risk_summary["unknown_severity"])
-        analysis_columns[3].metric("Unknown Reachability", risk_summary["reachability"]["UNKNOWN"])
-        analysis_columns[4].metric("Total findings", len(findings))
-        st.caption(
-            "Unknown Severity: OSV did not provide a recognized severity label. "
-            "Unknown Reachability: source analysis could not determine whether the package is imported. "
-            "Review these findings using the advisory and source evidence."
-        )
-        st.markdown("**Reachability breakdown**")
-        breakdown = risk_summary["reachability"]
-        reach_columns = st.columns(3)
-        reach_columns[0].metric("USED", breakdown["USED"])
-        reach_columns[1].metric("NOT_FOUND", breakdown["NOT_FOUND"])
-        reach_columns[2].metric("UNKNOWN", breakdown["UNKNOWN"])
-        st.caption("Scores are triage heuristics, not probabilities of exploitation. Review the factor-by-factor explanation for each finding.")
-    elif matching_scan:
-        st.info("The completed scan returned no vulnerability findings to score.")
-    else:
-        st.info("Risk statistics will appear after a completed scan returns findings.")
-    _render_reports(findings if matching_scan else [], matching_scan)
-    st.caption("Import detection does not prove exploitability. NOT_FOUND does not establish that a dependency is unused or safe.")
+    if active_section == "overview":
+        _render_overview(findings, dependencies, statuses, matching_scan, scan_button)
+        if not matching_scan:
+            st.info("Upload a project ZIP and start a scan to populate findings, analytics, inventory, and reports.")
+    elif active_section == "investigation":
+        _render_queue(findings, vulnerabilities, reachability, matching_scan)
+        _render_inventory(dependencies, matching_scan)
+    elif active_section == "intelligence":
+        _render_analytics(findings, vulnerabilities, matching_scan)
+    elif active_section == "reports":
+        _render_reports(findings if matching_scan else [], matching_scan)
 
 
 if __name__ == "__main__":
