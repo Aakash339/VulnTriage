@@ -149,9 +149,17 @@ class DependencyAgentTests(unittest.TestCase):
         self.assertEqual(parse_dependencies(str(self.root / "missing")), [])
 
     def test_30_ignored_directories(self):
-        for folder in (".git", ".venv", "venv", "node_modules", "__pycache__"):
+        for folder in (".git", ".venv", "venv", "node_modules", "__pycache__", "target", "build", "dist"):
             self.put(f"{folder}/requirements.txt", "hidden==1\n")
         self.assertEqual(self.deps(), [])
+
+    def test_generated_directories_do_not_add_copied_manifests(self):
+        self.put("pom.xml", "<project><dependencies><dependency><groupId>real</groupId><artifactId>app</artifactId><version>1</version></dependency></dependencies></project>")
+        self.put("target/classes/pom.xml", "<project><dependencies><dependency><groupId>generated</groupId><artifactId>copy</artifactId><version>9</version></dependency></dependencies></project>")
+        self.put("build/copied/package.json", json.dumps({"dependencies": {"ghost": "1"}}))
+        self.put("dist/copied/requirements.txt", "ghost-python==1\n")
+        dependencies = self.deps()
+        self.assertEqual([(item["name"], item["ecosystem"]) for item in dependencies], [("real:app", "Maven")])
 
     def test_31_empty_project(self):
         self.assertEqual(self.deps(), [])

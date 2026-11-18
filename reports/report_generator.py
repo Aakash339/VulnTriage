@@ -21,6 +21,7 @@ _COLUMNS = (
     ("Recommendation", "recommendation"),
     ("Reachability Evidence", "reachability_evidence"),
     ("Reachability Interpretation", "reachability_interpretation"),
+    ("Ecosystem", "ecosystem"),
 )
 _REACHABILITY_STATUSES = {"USED", "NOT_FOUND", "UNKNOWN"}
 _REACHABILITY_INTERPRETATIONS = {
@@ -45,20 +46,34 @@ def generate_csv_report(findings: list, reachability: list | None = None) -> byt
         for finding in findings:
             if not isinstance(finding, Mapping):
                 continue
-            record = reachability_by_package.get(_package_key(finding.get("package")), {})
+            record = reachability_by_package.get(_record_key(finding), {})
             status = _status(finding.get("reachability"), record.get("status"))
             evidence = record.get("evidence", [])
             evidence_value = "\n".join(evidence) if evidence else "No static import evidence available"
-            row = [_csv_value(finding.get(key)) for _, key in _COLUMNS[:-2]]
-            row.extend((evidence_value, _REACHABILITY_INTERPRETATIONS[status]))
+            row = [_csv_value(finding.get(key)) for _, key in _COLUMNS
+                   if key not in {"reachability_evidence", "reachability_interpretation", "ecosystem"}]
+            row.extend((evidence_value, _REACHABILITY_INTERPRETATIONS[status], _csv_value(finding.get("ecosystem"))))
             writer.writerow(row)
     return output.getvalue().encode("utf-8")
 
 
-def _package_key(value) -> str:
+def _package_key(value, ecosystem=None) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
+    ecosystem = ecosystem.strip().casefold() if isinstance(ecosystem, str) else ""
+    if ecosystem == "maven":
+        # Maven groupId:artifactId coordinates are exact identifiers.
+        return value.strip()
+    if ecosystem == "npm":
+        return value.strip().casefold()
     return _PACKAGE_SEPARATORS.sub("-", value.strip()).casefold()
+
+
+def _record_key(record):
+    ecosystem = record.get("ecosystem") if isinstance(record, Mapping) else None
+    normalized_ecosystem = ecosystem.strip().casefold() if isinstance(ecosystem, str) and ecosystem.strip() else None
+    canonical = {"pypi": "PyPI", "npm": "npm", "maven": "Maven"}.get(normalized_ecosystem, normalized_ecosystem)
+    return canonical, _package_key(record.get("package"), canonical)
 
 
 def _status(value, fallback="UNKNOWN") -> str:
@@ -68,16 +83,16 @@ def _status(value, fallback="UNKNOWN") -> str:
     return candidate if candidate in _REACHABILITY_STATUSES else "UNKNOWN"
 
 
-def _reachability_by_package(records) -> dict[str, dict[str, object]]:
+def _reachability_by_package(records) -> dict[tuple[str | None, str], dict[str, object]]:
     """Collect and deduplicate evidence from raw reachability records."""
-    result: dict[str, dict[str, object]] = {}
+    result: dict[tuple[str | None, str], dict[str, object]] = {}
     if not isinstance(records, (list, tuple)):
         return result
     for record in records:
         if not isinstance(record, Mapping):
             continue
-        key = _package_key(record.get("package"))
-        if not key:
+        key = _record_key(record)
+        if not key[1]:
             continue
         status = _status(record.get("status"))
         evidence_value = record.get("evidence")

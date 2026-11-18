@@ -68,6 +68,36 @@ class RemediationAgentTests(unittest.TestCase):
             "risk_score", "risk_level", "risk_factors", "risk_explanation",
         })
 
+    def test_ecosystem_identity_separates_same_name_vulnerabilities_and_reachability(self):
+        vulnerabilities = [
+            vuln(ecosystem="PyPI"),
+            vuln(ecosystem="npm"),
+        ]
+        reachability = [
+            {"package": "flask", "ecosystem": "PyPI", "status": "USED", "evidence": ["app.py:1: import flask"]},
+            {"package": "flask", "ecosystem": "npm", "status": "NOT_FOUND", "evidence": []},
+        ]
+        findings = generate_remediation(vulnerabilities, reachability)
+        self.assertEqual(len(findings), 2)
+        by_ecosystem = {finding["ecosystem"]: finding for finding in findings}
+        self.assertEqual(by_ecosystem["PyPI"]["reachability"], "USED")
+        self.assertEqual(by_ecosystem["npm"]["reachability"], "NOT_FOUND")
+        self.assertGreater(by_ecosystem["PyPI"]["risk_score"], by_ecosystem["npm"]["risk_score"])
+        self.assertEqual(by_ecosystem["PyPI"]["priority"], "HIGH")
+        self.assertEqual(by_ecosystem["npm"]["priority"], "MEDIUM")
+
+    def test_case_and_punctuation_identity_rules_are_ecosystem_specific(self):
+        records = [
+            vuln(package="foo_bar", ecosystem="PyPI", vulnerability_id="PYPI-1"),
+            vuln(package="foo.bar", ecosystem="PyPI", vulnerability_id="PYPI-1"),
+            vuln(package="foo_bar", ecosystem="npm", vulnerability_id="NPM-1"),
+            vuln(package="org.foo-bar:core", ecosystem="Maven", vulnerability_id="MAVEN-1"),
+            vuln(package="org.foo_bar:core", ecosystem="Maven", vulnerability_id="MAVEN-1"),
+        ]
+        findings = generate_remediation(records, [])
+        self.assertEqual(len(findings), 4)  # PyPI-normalized duplicate collapses; npm/Maven identities remain distinct.
+        self.assertEqual(sum(item["ecosystem"] == "Maven" for item in findings), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

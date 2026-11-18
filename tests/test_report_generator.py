@@ -9,7 +9,7 @@ HEADER = [
     "Package", "Vulnerability ID", "Severity", "Reachability", "Priority",
     "Risk Score", "Risk Level", "Risk Factors", "Risk Explanation",
     "Installed Version", "Recommended Version", "Recommendation",
-    "Reachability Evidence", "Reachability Interpretation",
+    "Reachability Evidence", "Reachability Interpretation", "Ecosystem",
 ]
 INTERPRETATIONS = {
     "USED": "Static import evidence was detected. This does not prove runtime execution or exploitability.",
@@ -34,7 +34,7 @@ class ReportGeneratorTests(unittest.TestCase):
         self.assertEqual(rows[1][:3], ["pkg", "CVE-1", "HIGH"])
         self.assertEqual(rows[2][:2], ["pkg2", "CVE-2"])
         self.assertEqual(rows[2][2:12], [""] * 10)
-        self.assertEqual(rows[2][12:], ["No static import evidence available", INTERPRETATIONS["UNKNOWN"]])
+        self.assertEqual(rows[2][12:14], ["No static import evidence available", INTERPRETATIONS["UNKNOWN"]])
 
     def test_csv_escapes_commas_quotes_and_newlines(self):
         recommendation = 'Upgrade carefully, then review "compatibility".\nRetest.'
@@ -50,7 +50,7 @@ class ReportGeneratorTests(unittest.TestCase):
         rows = self.rows(generate_csv_report([{"recommendation": "Fix"}]))
         self.assertEqual(rows[0], HEADER)
         self.assertEqual(rows[1], ["", "", "", "", "", "", "", "", "", "", "", "Fix",
-                                   "No static import evidence available", INTERPRETATIONS["UNKNOWN"]])
+                                   "No static import evidence available", INTERPRETATIONS["UNKNOWN"], ""])
 
     def test_risk_fields_are_exported(self):
         row = {
@@ -91,10 +91,11 @@ class ReportGeneratorTests(unittest.TestCase):
         ]
         rows = self.rows(generate_csv_report(findings, reachability))
         self.assertEqual(rows[0], HEADER)
-        self.assertEqual(len(HEADER), 14)
+        self.assertEqual(len(HEADER), 15)
         self.assertEqual(len(rows), 37)
-        self.assertTrue(all(len(row) == 14 for row in rows))
-        self.assertTrue(all(row[-1] for row in rows[1:]), "unexpected empty trailing column or recommendation")
+        self.assertTrue(all(len(row) == 15 for row in rows))
+        self.assertTrue(all(row[11] for row in rows[1:]), "recommendation column unexpectedly empty")
+        self.assertTrue(all(row[14] == "" for row in rows[1:]), "legacy findings should have blank ecosystem")
         self.assertEqual(rows[1][7], "Severity contribution; Reachability contribution")
         self.assertEqual(rows[1][8], "Risk explanation for finding 0.")
         self.assertEqual(rows[-1][11], "Upgrade package-35 and validate compatibility.")
@@ -136,6 +137,21 @@ class ReportGeneratorTests(unittest.TestCase):
         rows = self.rows(generate_csv_report([{"package": "pkg", "reachability": "NOT_FOUND"}]))
         self.assertEqual(rows[1][12], "No static import evidence available")
         self.assertEqual(rows[1][13], INTERPRETATIONS["NOT_FOUND"])
+
+    def test_maven_coordinates_match_exactly_including_distinct_punctuation(self):
+        findings = [
+            {"package": "org.foo-bar:core", "ecosystem": "Maven", "reachability": "USED"},
+            {"package": "org.foo_bar:core", "ecosystem": "Maven", "reachability": "NOT_FOUND"},
+        ]
+        reachability = [
+            {"package": "org.foo-bar:core", "ecosystem": "Maven", "status": "USED", "evidence": ["A.java:1: import one;"]},
+            {"package": "org.foo_bar:core", "ecosystem": "Maven", "status": "NOT_FOUND", "evidence": []},
+        ]
+        rows = self.rows(generate_csv_report(findings, reachability))
+        self.assertEqual([row[14] for row in rows[1:]], ["Maven", "Maven"])
+        self.assertEqual(rows[1][12], "A.java:1: import one;")
+        self.assertEqual(rows[2][12], "No static import evidence available")
+        self.assertEqual(rows[2][13], INTERPRETATIONS["NOT_FOUND"])
 
     def test_non_mapping_rows_are_skipped(self):
         self.assertEqual(self.rows(generate_csv_report([None, "bad"])), [HEADER])

@@ -63,7 +63,7 @@ class ReachabilityAgentTests(unittest.TestCase):
 
     def test_ignored_directories(self):
         self.write("main.py", "print('clean source file')\n")
-        for folder in (".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"):
+        for folder in (".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", "target"):
             self.write(f"{folder}/hidden.js", "import 'secret-package';\n")
         self.assertEqual(self.statuses("secret-package")["secret-package"]["status"], "NOT_FOUND")
 
@@ -272,6 +272,26 @@ class ReachabilityAgentTests(unittest.TestCase):
         self.assertEqual(by_package["requests"]["status"], "USED")
         self.assertEqual(by_package["lodash"]["status"], "USED")
         self.assertEqual(by_package["com.google.guava:guava"]["status"], "USED")
+
+    def test_same_package_name_is_scoped_to_ecosystem_and_source_language(self):
+        self.write("clean.py", "print('no import')\n")
+        self.write("app.js", "import sharedpkg from 'sharedpkg';\n")
+        results = check_reachability(str(self.root), [
+            {"package": "sharedpkg", "ecosystem": "PyPI"},
+            {"package": "sharedpkg", "ecosystem": "npm"},
+        ])
+        by_ecosystem = {item["ecosystem"]: item for item in results}
+        self.assertEqual(by_ecosystem["PyPI"]["status"], "NOT_FOUND")
+        self.assertEqual(by_ecosystem["npm"]["status"], "USED")
+
+    def test_generated_java_source_does_not_create_reachability_evidence(self):
+        self.write("Main.java", "class Main {}\n")
+        self.write("target/generated-sources/Main.java", "import com.google.common.collect.ImmutableList;\n")
+        result = check_reachability(str(self.root), [
+            {"package": "com.google.guava:guava", "ecosystem": "Maven"},
+        ])[0]
+        self.assertEqual(result["status"], "NOT_FOUND")
+        self.assertEqual(result["evidence"], [])
 
 
 if __name__ == "__main__":

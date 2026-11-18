@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 _IGNORED_DIRS = {
-    ".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist",
+    ".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", "target",
 }
 _SUPPORTED_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".java"}
 _PYTHON_IMPORT_NAMES = {
@@ -117,6 +117,24 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).casefold()
 
 
+def _ecosystem(record: dict) -> str | None:
+    value = record.get("ecosystem")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip().casefold()
+    return {"pypi": "PyPI", "npm": "npm", "maven": "Maven"}.get(value, value)
+
+
+def _identity(ecosystem: str | None, package: str) -> tuple[str | None, str]:
+    if ecosystem == "Maven":
+        return ecosystem, package.strip()
+    if ecosystem == "npm":
+        return ecosystem, package.strip().casefold()
+    if ecosystem == "PyPI":
+        return ecosystem, _normalize_name(package)
+    return ecosystem, _normalize_name(package)
+
+
 def _python_roots(package: str) -> set[str]:
     """Return import roots associated with a Python distribution name."""
     normalized = _normalize_name(package)
@@ -139,7 +157,7 @@ def _module_matches(module: str, package: str, is_python: bool) -> bool:
 
     components = module.split("/")
     root = "/".join(components[:2]) if components[0].startswith("@") else components[0]
-    return _normalize_name(root) == _normalize_name(package)
+    return root.casefold() == package.casefold()
 
 
 def _java_lexical_info(source: str) -> tuple[str, bool]:
@@ -226,13 +244,17 @@ def _java_imports(source: str):
     return imports, reliable
 
 
-def _add_evidence(evidence: dict, packages: list[str], module: str,
+def _add_evidence(evidence: dict, packages: list[tuple[tuple[str | None, str], str, str | None]], module: str,
                   is_python: bool, filename: str, line: int, statement: str) -> None:
-    for package in packages:
+    for identity, package, ecosystem in packages:
+        if ecosystem == "PyPI" and not is_python:
+            continue
+        if ecosystem == "npm" and is_python:
+            continue
         if _module_matches(module, package, is_python):
             item = f"{filename}:{line}: {statement.strip()}"
-            if item not in evidence[package]:
-                evidence[package].append(item)
+            if item not in evidence[identity]:
+                evidence[identity].append(item)
 
 
 def _python_dynamic_imports(tree: ast.AST):
@@ -278,9 +300,8 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
     if not isinstance(vulnerabilities, (list, tuple)):
         return []
 
-    targets: list[tuple[str, str, str]] = []
-    package_keys: set[str] = set()
-    maven_keys: set[str] = set()
+    targets: list[tuple[str, str | None, tuple[str | None, str]]] = []
+    target_keys: set[tuple[str | None, str]] = set()
     for record in vulnerabilities or []:
         if not isinstance(record, dict):
             continue
@@ -288,28 +309,23 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
         if not isinstance(name, str) or not name.strip():
             continue
         name = name.strip()
-        ecosystem = record.get("ecosystem")
-        if ecosystem == "Maven":
-            # Maven coordinates are identifiers, not Python/npm package names.
-            if name not in maven_keys:
-                maven_keys.add(name)
-                targets.append((name, "Maven", name))
-        else:
-            # Retain the existing Python/npm normalization and duplicate behavior.
-            key = _normalize_name(name)
-            if key not in package_keys:
-                package_keys.add(key)
-                targets.append((name, "other", name))
+        ecosystem = _ecosystem(record)
+        identity = _identity(ecosystem, name)
+        if identity not in target_keys:
+            target_keys.add(identity)
+            targets.append((name, ecosystem, identity))
 
     if not targets:
         return []
 
-    packages = [name for name, ecosystem, _ in targets if ecosystem != "Maven"]
-    evidence = {package: [] for package in packages}
-    maven_evidence = {key: [] for _, ecosystem, key in targets if ecosystem == "Maven"}
+    packages = [(identity, name, ecosystem) for name, ecosystem, identity in targets
+                if ecosystem != "Maven"]
+    evidence = {identity: [] for identity, _, _ in packages}
+    maven_evidence = {identity[1]: [] for _, ecosystem, identity in targets if ecosystem == "Maven"}
     maven_ambiguous: set[str] = set()
     maven_coordinates = set(maven_evidence)
-    supported_files = 0
+    supported_files = {"python": 0, "javascript": 0}
+    language_scan_failed = {"python": False, "javascript": False}
     java_files = 0
     try:
         root = Path(project_path)
@@ -328,6 +344,8 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
         nonlocal scan_failed, java_scan_failed
         scan_failed = True
         java_scan_failed = True
+        language_scan_failed["python"] = True
+        language_scan_failed["javascript"] = True
 
     if root is not None and not scan_failed:
         try:
@@ -340,8 +358,10 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
                         continue
                     if suffix == ".java":
                         java_files += 1
+                    elif suffix == ".py":
+                        supported_files["python"] += 1
                     else:
-                        supported_files += 1
+                        supported_files["javascript"] += 1
                     relative = path.relative_to(root).as_posix()
                     try:
                         if suffix == ".py":
@@ -352,15 +372,17 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
                     except (OSError, UnicodeError, SyntaxError):
                         if suffix == ".java":
                             java_scan_failed = True
+                        elif suffix == ".py":
+                            language_scan_failed["python"] = True
                         else:
-                            scan_failed = True
+                            language_scan_failed["javascript"] = True
                         continue
 
                     if suffix == ".py":
                         try:
                             tree = ast.parse(source, filename=relative)
                         except (SyntaxError, ValueError, TypeError, RecursionError):
-                            scan_failed = True
+                            language_scan_failed["python"] = True
                             continue
                         for node in ast.walk(tree):
                             if isinstance(node, ast.Import):
@@ -379,7 +401,7 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
                     elif suffix != ".java":
                         code_mask, string_literals, reliable = _javascript_lexical_info(source)
                         if not reliable:
-                            scan_failed = True
+                            language_scan_failed["javascript"] = True
                         for match in _JS_MODULE_RE.finditer(source):
                             # Reject import-like text inside comments and ordinary
                             # strings; accept only a real quoted token at this offset.
@@ -419,14 +441,17 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
         except (OSError, ValueError):
             scan_failed = True
             java_scan_failed = True
+            language_scan_failed["python"] = True
+            language_scan_failed["javascript"] = True
 
     # No source files means there was no basis for a negative import finding.
-    if supported_files == 0:
+    if not any(supported_files.values()):
         scan_failed = True
 
     results = []
-    for package, ecosystem, key in targets:
+    for package, ecosystem, identity in targets:
         if ecosystem == "Maven":
+            key = identity[1]
             matches = maven_evidence[key]
             if matches:
                 status = "USED"
@@ -440,7 +465,16 @@ def check_reachability(project_path: str, vulnerabilities: list) -> list:
             else:
                 status = "NOT_FOUND"
         else:
-            matches = evidence[package]
-            status = "USED" if matches else ("UNKNOWN" if scan_failed else "NOT_FOUND")
-        results.append({"package": package, "status": status, "evidence": matches})
+            matches = evidence[identity]
+            if ecosystem == "PyPI":
+                complete = supported_files["python"] > 0 and not language_scan_failed["python"]
+            elif ecosystem == "npm":
+                complete = supported_files["javascript"] > 0 and not language_scan_failed["javascript"]
+            else:
+                complete = any(supported_files.values()) and not any(language_scan_failed.values())
+            status = "USED" if matches else ("NOT_FOUND" if complete else "UNKNOWN")
+        result = {"package": package, "status": status, "evidence": matches}
+        if ecosystem is not None:
+            result["ecosystem"] = ecosystem
+        results.append(result)
     return results

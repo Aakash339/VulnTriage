@@ -13,7 +13,11 @@ from urllib.parse import unquote
 from packaging.requirements import InvalidRequirement, Requirement
 
 
-_IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
+_IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "target", "build", "dist"}
+_UNSUPPORTED_MANIFESTS = {
+    "pyproject.toml", "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock", "pdm.lock",
+    "yarn.lock", "pnpm-lock.yaml", "pnpm-lock.yml", "bun.lock", "bun.lockb",
+}
 _NPM_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 _GRADLE_CONFIGURATIONS = (
     "implementation", "api", "runtimeOnly", "compileOnly", "compileOnlyApi",
@@ -23,6 +27,15 @@ _GRADLE_DECLARATION = re.compile(
     r"^\s*(?P<configuration>" + "|".join(sorted(_GRADLE_CONFIGURATIONS, key=len, reverse=True)) +
     r")\b\s*(?:\(\s*)?(?P<quote>['\"])(?P<coordinate>[^'\"\r\n]+)(?P=quote)\s*\)?\s*;?\s*$"
 )
+
+
+def _record_parse_failure(coverage: dict[str, Any] | None) -> None:
+    if isinstance(coverage, dict):
+        try:
+            current = int(coverage.get("parsing_failures", 0))
+        except (TypeError, ValueError):
+            current = 0
+        coverage["parsing_failures"] = current + 1
 
 
 def _py_name(name: str) -> str:
@@ -60,17 +73,26 @@ def _requirement_line(raw: str) -> tuple[str, str] | None:
         return None
 
 
-def _read_requirements(path: Path, root: Path) -> list[dict[str, str]]:
+def _read_requirements(path: Path, root: Path, coverage: dict[str, Any] | None = None) -> list[dict[str, str]]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
+        _record_parse_failure(coverage)
         return []
     result = []
+    had_parse_error = False
     for line in lines:
         parsed = _requirement_line(line)
         if parsed:
             name, version = parsed
             result.append(_dep(name, version, "PyPI", path, root))
+        else:
+            stripped = line.strip()
+            is_directive = stripped.startswith(("-r ", "--requirement ", "-c ", "--constraint "))
+            if stripped and not stripped.startswith("#") and not is_directive:
+                had_parse_error = True
+    if had_parse_error:
+        _record_parse_failure(coverage)
     return result
 
 
@@ -122,11 +144,12 @@ def _maven_coordinate(dependency: ET.Element, properties: dict[str, str], root: 
     return _dep(f"{group}:{artifact}", version, "Maven", source, root)
 
 
-def _pom_dependencies(path: Path, root: Path) -> list[dict[str, str]]:
+def _pom_dependencies(path: Path, root: Path, coverage: dict[str, Any] | None = None) -> list[dict[str, str]]:
     """Read direct POM dependencies; management entries only supply versions."""
     try:
         document = ET.parse(path).getroot()
     except (OSError, ET.ParseError, ValueError):
+        _record_parse_failure(coverage)
         return []
 
     properties: dict[str, str] = {}
@@ -159,12 +182,17 @@ def _pom_dependencies(path: Path, root: Path) -> list[dict[str, str]]:
     if direct_dependencies is None:
         return []
     result = []
+    had_parse_error = False
     for dependency in direct_dependencies:
         if not isinstance(dependency.tag, str) or dependency.tag.rsplit("}", 1)[-1] != "dependency":
             continue
         record = _maven_coordinate(dependency, properties, root, path, managed_versions)
         if record is not None:
             result.append(record)
+        else:
+            had_parse_error = True
+    if had_parse_error:
+        _record_parse_failure(coverage)
     return result
 
 
@@ -217,27 +245,38 @@ def _gradle_coordinate(raw: str, path: Path, root: Path) -> dict[str, str] | Non
     return _dep(f"{group}:{artifact}", version, "Maven", path, root)
 
 
-def _gradle_declarations(path: Path, root: Path) -> list[dict[str, str]]:
+def _gradle_declarations(path: Path, root: Path, coverage: dict[str, Any] | None = None) -> list[dict[str, str]]:
     try:
         source = _strip_gradle_comments(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError):
+        _record_parse_failure(coverage)
         return []
     result = []
+    had_parse_error = False
     for line in source.splitlines():
         match = _GRADLE_DECLARATION.fullmatch(line)
         if match:
             dependency = _gradle_coordinate(match.group("coordinate"), path, root)
             if dependency is not None:
                 result.append(dependency)
+            else:
+                had_parse_error = True
+        elif re.match(r"^\s*(?:" + "|".join(_GRADLE_CONFIGURATIONS) + r")\b", line):
+            # Count declarations the lightweight parser cannot safely evaluate.
+            had_parse_error = True
+    if had_parse_error:
+        _record_parse_failure(coverage)
     return result
 
 
-def _gradle_lock(path: Path, root: Path) -> list[dict[str, str]]:
+def _gradle_lock(path: Path, root: Path, coverage: dict[str, Any] | None = None) -> list[dict[str, str]]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
+        _record_parse_failure(coverage)
         return []
     result = []
+    had_parse_error = False
     for line in lines:
         value = line.strip()
         if not value or value.startswith("#") or "=" not in value:
@@ -246,34 +285,50 @@ def _gradle_lock(path: Path, root: Path) -> list[dict[str, str]]:
         dependency = _gradle_coordinate(coordinate, path, root)
         if dependency is not None:
             result.append(dependency)
+        else:
+            had_parse_error = True
+    if had_parse_error:
+        _record_parse_failure(coverage)
     return result
 
 
-def _json(path: Path) -> dict[str, Any] | None:
+def _json(path: Path, coverage: dict[str, Any] | None = None) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
+        _record_parse_failure(coverage)
         return None
-    return value if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        _record_parse_failure(coverage)
+        return None
+    return value
 
 
-def _package_manifest(path: Path, root: Path) -> list[dict[str, str]]:
-    data = _json(path)
+def _package_manifest(path: Path, root: Path, coverage: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    data = _json(path, coverage)
     if data is None:
         return []
     result = []
+    had_parse_error = False
     for section in _NPM_SECTIONS:
         values = data.get(section)
+        if values is None:
+            continue
         if not isinstance(values, dict):
+            had_parse_error = True
             continue
         for name, version in values.items():
             if isinstance(name, str) and isinstance(version, str) and name.strip():
                 result.append(_dep(name, version, "npm", path, root))
+            else:
+                had_parse_error = True
+    if had_parse_error:
+        _record_parse_failure(coverage)
     return result
 
 
-def _npm_lock(path: Path, root: Path) -> tuple[list[dict[str, str]], bool]:
-    data = _json(path)
+def _npm_lock(path: Path, root: Path, coverage: dict[str, Any] | None = None) -> tuple[list[dict[str, str]], bool]:
+    data = _json(path, coverage)
     if data is None:
         return [], False
     result: list[dict[str, str]] = []
@@ -304,6 +359,7 @@ def _npm_lock(path: Path, root: Path) -> tuple[list[dict[str, str]], bool]:
                     walk(children)
         walk(data["dependencies"])
         return result, True
+    _record_parse_failure(coverage)
     return [], False
 
 
@@ -319,14 +375,22 @@ def _identity(dep: dict[str, str]) -> tuple[str, str, str]:
     return dep["ecosystem"], name, dep["version"]
 
 
-def parse_dependencies(project_path: str) -> list[dict[str, str]]:
+def parse_dependencies(project_path: str, coverage: dict[str, Any] | None = None) -> list[dict[str, str]]:
     """Extract dependency declarations and lockfile resolutions from a project tree."""
     root = Path(project_path)
     if not root.is_dir():
+        _record_parse_failure(coverage)
         return []
 
     manifests: list[Path] = []
-    for current, dirs, files in os.walk(root):
+    unsupported_manifests = 0
+    walk_failed = False
+
+    def on_walk_error(_error: OSError) -> None:
+        nonlocal walk_failed
+        walk_failed = True
+
+    for current, dirs, files in os.walk(root, onerror=on_walk_error):
         dirs[:] = sorted(d for d in dirs if d not in _IGNORED_DIRS)
         base = Path(current)
         for filename in files:
@@ -335,7 +399,14 @@ def parse_dependencies(project_path: str) -> list[dict[str, str]]:
                 "build.gradle", "build.gradle.kts", "gradle.lockfile",
             }:
                 manifests.append(base / filename)
+            elif filename in _UNSUPPORTED_MANIFESTS:
+                unsupported_manifests += 1
     manifests.sort(key=lambda p: p.relative_to(root).as_posix())
+    if isinstance(coverage, dict):
+        coverage["manifests_scanned"] = len(manifests)
+        coverage["unsupported_manifests"] = unsupported_manifests
+    if walk_failed:
+        _record_parse_failure(coverage)
 
     python_deps: list[dict[str, str]] = []
     npm_declarations: list[dict[str, str]] = []
@@ -345,18 +416,18 @@ def parse_dependencies(project_path: str) -> list[dict[str, str]]:
     gradle_locks: list[tuple[Path, list[dict[str, str]]]] = []
     for path in manifests:
         if path.name == "requirements.txt":
-            python_deps.extend(_read_requirements(path, root))
+            python_deps.extend(_read_requirements(path, root, coverage))
         elif path.name == "package.json":
-            npm_declarations.extend(_package_manifest(path, root))
+            npm_declarations.extend(_package_manifest(path, root, coverage))
         elif path.name == "package-lock.json":
-            deps, valid = _npm_lock(path, root)
+            deps, valid = _npm_lock(path, root, coverage)
             npm_locks.append((path, deps, valid))
         elif path.name == "pom.xml":
-            maven_deps.extend(_pom_dependencies(path, root))
+            maven_deps.extend(_pom_dependencies(path, root, coverage))
         elif path.name in {"build.gradle", "build.gradle.kts"}:
-            gradle_declarations.extend(_gradle_declarations(path, root))
+            gradle_declarations.extend(_gradle_declarations(path, root, coverage))
         elif path.name == "gradle.lockfile":
-            gradle_locks.append((path, _gradle_lock(path, root)))
+            gradle_locks.append((path, _gradle_lock(path, root, coverage)))
 
     # Apply the nearest lockfile to declarations in its directory subtree. Where it
     # resolves a name, the lock value wins; otherwise retain the manifest declaration.
@@ -407,4 +478,7 @@ def parse_dependencies(project_path: str) -> list[dict[str, str]]:
         # Prefer lockfile provenance where equivalent entries were also declared.
         if previous is None or dep["source_file"].endswith(("package-lock.json", "gradle.lockfile")):
             unique[key] = dep
-    return sorted(unique.values(), key=lambda d: (d["ecosystem"], _identity(d)[1], d["version"], d["source_file"]))
+    dependencies = sorted(unique.values(), key=lambda d: (d["ecosystem"], _identity(d)[1], d["version"], d["source_file"]))
+    if isinstance(coverage, dict):
+        coverage["dependencies_detected"] = len(dependencies)
+    return dependencies

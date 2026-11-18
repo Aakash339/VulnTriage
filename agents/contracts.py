@@ -29,6 +29,10 @@ class ReachabilityResult(TypedDict):
     evidence: list[str]
 
 
+class EcosystemReachabilityResult(ReachabilityResult):
+    ecosystem: str
+
+
 # 4. Remediation Agent Output
 class RemediationFinding(TypedDict):
     package: str
@@ -43,3 +47,7 @@ class RemediationFinding(TypedDict):
     risk_level: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]
     risk_factors: list[str]
     risk_explanation: str
+
+
+class EcosystemRemediationFinding(RemediationFinding):
+    ecosystem: str

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import html
 import math
 import os
+import re
 import stat
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 
 import streamlit as st
@@ -21,8 +24,11 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 500 * 1024 * 1024
 MAX_ARCHIVE_FILES = 10_000
 MAX_SINGLE_FILE_BYTES = 100 * 1024 * 1024
-IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
-PROJECT_MANIFESTS = {"requirements.txt", "package.json", "package-lock.json"}
+IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "target", "build", "dist"}
+PROJECT_MANIFESTS = {
+    "requirements.txt", "package.json", "package-lock.json", "pom.xml",
+    "build.gradle", "build.gradle.kts", "gradle.lockfile",
+}
 PRIORITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
 SORT_OPTIONS = (
@@ -43,6 +49,58 @@ NAVIGATION_ITEMS = (
 
 class ArchiveValidationError(ValueError):
     """Raised when an uploaded archive is unsafe or exceeds configured limits."""
+
+
+def _upload_identity(uploaded) -> str | None:
+    """Identify uploaded projects by content so same-name archives cannot collide."""
+    if uploaded is None:
+        return None
+    return hashlib.sha256(uploaded.getvalue()).hexdigest()
+
+
+def _coverage_notice(coverage, vulnerability_count: int) -> tuple[str, str]:
+    """Return concise, non-sensitive dashboard wording for scan coverage."""
+    if not isinstance(coverage, dict):
+        return "warning", "Scan coverage could not be determined; do not treat this scan as clean."
+
+    def count(name: str) -> int:
+        try:
+            return max(0, int(coverage.get(name, 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    status = coverage.get("status")
+    detected = count("dependencies_detected")
+    queried = count("successfully_queried_dependencies")
+    failed = count("failed_queries")
+    not_queried = count("not_queried_dependencies")
+    parse_failures = count("parsing_failures")
+    unsupported = count("unsupported_manifests")
+
+    if status == "COMPLETE":
+        message = f"Coverage complete: OSV successfully checked {queried} of {detected} detected dependencies."
+        if vulnerability_count == 0:
+            message += " OSV returned no vulnerability findings."
+        return "success", message
+    if status == "NO_SUPPORTED_DEPENDENCIES":
+        message = "No supported dependencies were detected; OSV was not queried. This is not a clean scan."
+        if unsupported:
+            message += f" {unsupported} unsupported manifest(s) were present."
+        return "warning", message
+    if status == "ALL_OSV_QUERIES_FAILED":
+        return "error", f"Incomplete scan: all {detected} dependency queries failed. No vulnerability conclusion is available."
+    return (
+        "warning",
+        f"Partial scan: {detected} dependencies detected, {queried} queried successfully, {failed} OSV queries failed, "
+        f"{not_queried} not queried, {parse_failures} parsing failures, and {unsupported} unsupported manifests. "
+        "Findings may be incomplete.",
+    )
+
+
+def _display_coverage_notice(coverage, vulnerability_count: int) -> tuple[str, str]:
+    level, message = _coverage_notice(coverage, vulnerability_count)
+    getattr(st, level)(message)
+    return level, message
 
 
 def _safe_member_target(destination: Path, member_name: str) -> Path:
@@ -70,49 +128,93 @@ def _safe_member_target(destination: Path, member_name: str) -> Path:
 
 def _extract_project_zip(archive_bytes: bytes, destination: Path) -> Path:
     """Safely extract a bounded ZIP and return the likely project root."""
+    destination = destination.resolve()
     try:
         archive = zipfile.ZipFile(io.BytesIO(archive_bytes))
     except (zipfile.BadZipFile, OSError) as error:
         raise ArchiveValidationError("This file is not a readable ZIP archive.") from error
 
-    with archive:
-        members = archive.infolist()
-        if len(members) > MAX_ARCHIVE_FILES:
-            raise ArchiveValidationError(f"The ZIP has too many entries (limit: {MAX_ARCHIVE_FILES:,}).")
-        declared_total = 0
-        for info in members:
-            if info.flag_bits & 0x1:
-                raise ArchiveValidationError("Password-protected ZIP files are not supported.")
-            _safe_member_target(destination, info.filename)
-            mode = info.external_attr >> 16
-            if stat.S_ISLNK(mode):
-                raise ArchiveValidationError("Symbolic links in ZIP files are not supported.")
-            if info.is_dir():
-                continue
-            if info.file_size > MAX_SINGLE_FILE_BYTES:
-                raise ArchiveValidationError("A file in the ZIP exceeds the 100 MB per-file limit.")
-            declared_total += info.file_size
-            if declared_total > MAX_EXTRACTED_BYTES:
-                raise ArchiveValidationError("The ZIP expands beyond the 500 MB extraction limit.")
+    created_paths: set[Path] = set()
 
-        actual_total = 0
-        for info in members:
-            target = _safe_member_target(destination, info.filename)
-            if info.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
+    def rollback_partial_extraction() -> None:
+        for path in sorted(created_paths, key=lambda item: len(item.parts), reverse=True):
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    path.rmdir()
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError:
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            actual_file_size = 0
-            with archive.open(info, "r") as source, target.open("wb") as output:
-                while True:
-                    chunk = source.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    actual_total += len(chunk)
-                    actual_file_size += len(chunk)
-                    if actual_total > MAX_EXTRACTED_BYTES or actual_file_size > MAX_SINGLE_FILE_BYTES:
-                        raise ArchiveValidationError("The ZIP expanded beyond the configured extraction limit.")
-                    output.write(chunk)
+
+    try:
+        with archive:
+            members = archive.infolist()
+            if len(members) > MAX_ARCHIVE_FILES:
+                raise ArchiveValidationError(f"The ZIP has too many entries (limit: {MAX_ARCHIVE_FILES:,}).")
+            declared_total = 0
+            seen_targets: set[str] = set()
+            for info in members:
+                if info.flag_bits & 0x1:
+                    raise ArchiveValidationError("Password-protected ZIP files are not supported.")
+                target = _safe_member_target(destination, info.filename)
+                normalized_target = os.path.normcase(str(target.resolve())).casefold()
+                if normalized_target in seen_targets:
+                    raise ArchiveValidationError("The ZIP contains duplicate file paths.")
+                seen_targets.add(normalized_target)
+                mode = info.external_attr >> 16
+                if stat.S_ISLNK(mode):
+                    raise ArchiveValidationError("Symbolic links in ZIP files are not supported.")
+                if info.is_dir():
+                    continue
+                if info.file_size > MAX_SINGLE_FILE_BYTES:
+                    raise ArchiveValidationError("A file in the ZIP exceeds the 100 MB per-file limit.")
+                declared_total += info.file_size
+                if declared_total > MAX_EXTRACTED_BYTES:
+                    raise ArchiveValidationError("The ZIP expands beyond the 500 MB extraction limit.")
+
+            actual_total = 0
+            for info in members:
+                target = _safe_member_target(destination, info.filename)
+                if info.is_dir():
+                    if not target.exists():
+                        ancestor = target
+                        while ancestor != destination and not ancestor.exists():
+                            created_paths.add(ancestor)
+                            ancestor = ancestor.parent
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                ancestor = target.parent
+                while ancestor != destination and not ancestor.exists():
+                    created_paths.add(ancestor)
+                    ancestor = ancestor.parent
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    created_paths.add(target)
+                actual_file_size = 0
+                try:
+                    with archive.open(info, "r") as source, target.open("wb") as output:
+                        while True:
+                            chunk = source.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            actual_total += len(chunk)
+                            actual_file_size += len(chunk)
+                            if actual_total > MAX_EXTRACTED_BYTES or actual_file_size > MAX_SINGLE_FILE_BYTES:
+                                raise ArchiveValidationError("The ZIP expanded beyond the configured extraction limit.")
+                            output.write(chunk)
+                except ArchiveValidationError:
+                    raise
+                except (zipfile.BadZipFile, OSError, EOFError, RuntimeError, zlib.error) as error:
+                    raise ArchiveValidationError("The ZIP is corrupt or cannot be extracted.") from error
+
+    except ArchiveValidationError:
+        archive.close()
+        rollback_partial_extraction()
+        raise
+    except (zipfile.BadZipFile, OSError, EOFError, RuntimeError, zlib.error) as error:
+        archive.close()
+        rollback_partial_extraction()
+        raise ArchiveValidationError("The ZIP is corrupt or cannot be extracted.") from error
 
     return _find_project_root(destination)
 
@@ -132,6 +234,7 @@ def _find_project_root(extraction_root: Path) -> Path:
 def _finding_columns() -> list[str]:
     return [
         "package",
+        "ecosystem",
         "vulnerability_id",
         "severity",
         "reachability",
@@ -151,6 +254,19 @@ def _field_text(finding, field: str, default: str = "UNKNOWN") -> str:
         return default
     value = finding.get(field)
     return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _finding_identity(record: dict) -> tuple[str, str]:
+    ecosystem = _field_text(record, "ecosystem", "").strip()
+    package = _field_text(record, "package", "").strip()
+    lowered = ecosystem.casefold()
+    if lowered == "maven":
+        return "Maven", package
+    if lowered == "npm":
+        return "npm", package.casefold()
+    if lowered == "pypi":
+        return "PyPI", re.sub(r"[-_.]+", "-", package).casefold()
+    return "", package.casefold()
 
 
 def _priority_rank(finding) -> int:
@@ -309,7 +425,7 @@ def _security_analytics(findings: list, vulnerabilities: list) -> dict[str, obje
     risk_level = {value: 0 for value in risk_order}
     reachability = {"USED": 0, "NOT_FOUND": 0, "UNKNOWN": 0}
     scores = []
-    packages: dict[str, dict[str, object]] = {}
+    packages: dict[tuple[str, str], dict[str, object]] = {}
 
     for finding in findings if isinstance(findings, list) else []:
         if not isinstance(finding, dict):
@@ -327,9 +443,11 @@ def _security_analytics(findings: list, vulnerabilities: list) -> dict[str, obje
         package_name = _field_text(finding, "package", "").strip()
         if not package_name:
             continue
-        package_key = package_name.casefold()
+        ecosystem_name, package_identity = _finding_identity(finding)
+        package_key = (ecosystem_name, package_identity)
         entry = packages.setdefault(package_key, {
             "package": package_name, "vulnerability_count": 0,
+            "ecosystem": ecosystem_name or "UNKNOWN",
             "highest_risk_score": None, "highest_severity": "UNKNOWN",
             "remediation_priority": "UNKNOWN",
         })
@@ -348,7 +466,7 @@ def _security_analytics(findings: list, vulnerabilities: list) -> dict[str, obje
         packages.values(),
         key=lambda row: (-row["vulnerability_count"],
                          -(row["highest_risk_score"] if row["highest_risk_score"] is not None else -1),
-                         row["package"].casefold()),
+                         row["ecosystem"].casefold(), row["package"].casefold()),
     )
     highest_priority = sorted(
         [finding for finding in findings if isinstance(finding, dict)] if isinstance(findings, list) else [],
@@ -384,7 +502,7 @@ def _security_analytics(findings: list, vulnerabilities: list) -> dict[str, obje
         if reachability["UNKNOWN"]:
             observations.append(f"{reachability['UNKNOWN']} findings have unknown reachability and may need source-level review.")
         if package_ranking:
-            observations.append(f"{package_ranking[0]['package']} has the most findings ({package_ranking[0]['vulnerability_count']}).")
+            observations.append(f"{package_ranking[0]['package']} ({package_ranking[0]['ecosystem']}) has the most findings ({package_ranking[0]['vulnerability_count']}).")
         if fixed_count:
             observations.append(f"OSV reports fixed versions for {fixed_count} vulnerability record(s).")
 
@@ -406,9 +524,9 @@ def _security_analytics(findings: list, vulnerabilities: list) -> dict[str, obje
 
 def _finding_summary(findings: list) -> dict[str, int]:
     packages = {
-        package.casefold()
+        _finding_identity(finding)
         for finding in findings
-        if (package := _field_text(finding, "package", ""))
+        if _field_text(finding, "package", "")
     }
     return {
         "total": len(findings),
@@ -624,8 +742,8 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
         return
     st.caption(f"Showing {len(sorted_findings)} of {len(findings)} findings · sorted by {sort_option}.")
 
-    columns = ("package", "vulnerability_id", "installed_version", "severity", "risk_score", "reachability", "priority")
-    labels = ("PACKAGE", "CVE / OSV ID", "INSTALLED", "SEVERITY", "RISK", "REACHABILITY", "PRIORITY")
+    columns = ("package", "ecosystem", "vulnerability_id", "installed_version", "severity", "risk_score", "reachability", "priority")
+    labels = ("PACKAGE", "ECOSYSTEM", "CVE / OSV ID", "INSTALLED", "SEVERITY", "RISK", "REACHABILITY", "PRIORITY")
     body = []
     for finding in sorted_findings:
         cells = []
@@ -649,13 +767,13 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
 
     st.subheader("Finding details")
     vuln_by_key = {
-        (_field_text(record, "package", "").casefold(), _field_text(record, "vulnerability_id", "").casefold()): record
+        (*_finding_identity(record), _field_text(record, "vulnerability_id", "").casefold()): record
         for record in vulnerability_records if isinstance(record, dict)
     }
     reach_by_package = {}
     for record in reachability_records:
         if isinstance(record, dict):
-            reach_by_package.setdefault(_field_text(record, "package", "").casefold(), []).append(record)
+            reach_by_package.setdefault(_finding_identity(record), []).append(record)
 
     for finding in sorted_findings:
         package = _field_text(finding, "package", "Unknown package")
@@ -664,7 +782,8 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
         score = _risk_score(finding)
         score_label = f"{score:.0f}" if score is not None else "—"
         with st.expander(f"{severity}  ·  {package}  ·  {vuln_id}  ·  Risk {score_label}", expanded=False):
-            vulnerability = vuln_by_key.get((package.casefold(), vuln_id.casefold()), {})
+            identity = _finding_identity(finding)
+            vulnerability = vuln_by_key.get((*identity, vuln_id.casefold()), {})
             left, right = st.columns(2)
             left.markdown("**Vulnerability summary**")
             left.write(_field_text(vulnerability, "summary", "Summary was not included in the OSV result."))
@@ -684,7 +803,7 @@ def _render_queue(findings: list[dict], vulnerability_records: list[dict], reach
             right.markdown("**Static Import Evidence**")
             reachability_status = _field_text(finding, "reachability").upper()
             right.caption(_reachability_explanation(reachability_status))
-            records = reach_by_package.get(package.casefold(), [])
+            records = reach_by_package.get(identity, [])
             evidence = []
             for record in records:
                 items = record.get("evidence")
@@ -819,6 +938,7 @@ def _render_analytics(findings: list, vulnerabilities: list, scan_completed: boo
             st.dataframe([
                 {
                     "Package": row["package"],
+                    "Ecosystem": row["ecosystem"],
                     "Vulnerability count": row["vulnerability_count"],
                     "Highest risk score": f"{row['highest_risk_score']:g}" if row["highest_risk_score"] is not None else "Unknown",
                     "Highest severity": row["highest_severity"],
@@ -834,6 +954,7 @@ def _render_analytics(findings: list, vulnerabilities: list, scan_completed: boo
         st.dataframe([
             {
                 "Package": _field_text(row, "package", ""),
+                "Ecosystem": _field_text(row, "ecosystem", "UNKNOWN"),
                 "Vulnerability ID": _field_text(row, "vulnerability_id", "Unknown"),
                 "Risk score": _risk_score(row),
                 "Severity": _normal_severity(row),
@@ -896,7 +1017,8 @@ def _navigation_section(value: str) -> str:
 
 def _scan_with_progress(uploaded, upload_identity) -> None:
     statuses = {stage: "pending" for stage, _ in _PIPELINE_STAGES}
-    data = {"dependencies": [], "vulnerabilities": [], "reachability": [], "findings": []}
+    data = {"dependencies": [], "vulnerabilities": [], "reachability": [], "findings": [], "coverage": {}}
+    coverage: dict = {}
     current_stage = "extraction"
     st.session_state["soc_scan_status"] = "scanning"
     st.session_state["soc_scan_project"] = uploaded.name
@@ -944,7 +1066,10 @@ def _scan_with_progress(uploaded, upload_identity) -> None:
                         progress_bar.progress(stage_progress[stage], text=f"{stage_names[stage]} complete")
                     redraw()
 
-                findings = run_vulntriage(str(project_root), progress_callback=on_progress)
+                findings = run_vulntriage(
+                    str(project_root), progress_callback=on_progress, coverage=coverage,
+                )
+                data["coverage"] = coverage
             st.session_state["vulntriage_findings"] = findings
             st.session_state["vulntriage_upload"] = upload_identity
             st.session_state["soc_scan_data"] = data
@@ -964,6 +1089,26 @@ def _scan_with_progress(uploaded, upload_identity) -> None:
             redraw()
 
 
+def _cached_scan_matches(upload_identity: str | None, session_state=None) -> bool:
+    state = st.session_state if session_state is None else session_state
+    return bool(
+        upload_identity
+        and state.get("vulntriage_upload") == upload_identity
+        and "vulntriage_findings" in state
+    )
+
+
+def _scan_or_reuse(uploaded, upload_identity: str) -> bool:
+    """Reuse a completed content-identical scan; otherwise start a fresh scan."""
+    if _cached_scan_matches(upload_identity):
+        st.session_state["soc_scan_upload"] = upload_identity
+        st.session_state["soc_scan_status"] = "completed"
+        st.info("This exact ZIP content already has a completed scan; reusing its results.")
+        return True
+    _scan_with_progress(uploaded, upload_identity)
+    return False
+
+
 def main() -> None:
     st.set_page_config(page_title="VulnTriage SOC", page_icon="🛡️", layout="wide")
     _render_theme()
@@ -975,9 +1120,9 @@ def main() -> None:
         st.markdown('<div class="soc-brand">VulnTriage</div><div class="soc-subbrand">Dependency Vulnerability Triage Agent</div>', unsafe_allow_html=True)
         st.write("Security operations console for dependency exposure, reachability signals, and remediation triage.")
         uploaded_from_widget = st.file_uploader(
-            "Load Python or npm project archive",
+            "Load Python, npm or Java project archive",
             type=["zip"],
-            help="Supports requirements.txt and npm package.json/package-lock.json projects.",
+            help="Supports requirements.txt, npm package.json/package-lock.json, Maven pom.xml and Gradle manifests/lockfiles.",
             key="soc-upload-widget",
             on_change=_remember_uploaded_project,
         )
@@ -990,7 +1135,7 @@ def main() -> None:
             if clear_col.button("Clear project", key="soc-clear-retained-upload"):
                 st.session_state.pop("soc_uploaded_project", None)
                 uploaded = None
-        upload_identity = (uploaded.name, uploaded.size) if uploaded is not None else None
+        upload_identity = _upload_identity(uploaded)
         if uploaded is not None and uploaded.size > MAX_UPLOAD_BYTES:
             st.error("The ZIP exceeds the 100 MB upload limit. Please provide a smaller archive.")
         scan_button = st.button(
@@ -1004,9 +1149,9 @@ def main() -> None:
             st.session_state["soc_scan_project"] = uploaded.name
             st.session_state["soc_scan_upload"] = upload_identity
             _render_topbar("scanning", uploaded.name, topbar_slot)
-            _scan_with_progress(uploaded, upload_identity)
+            _scan_or_reuse(uploaded, upload_identity)
     else:
-        upload_identity = (uploaded.name, uploaded.size) if uploaded is not None else None
+        upload_identity = _upload_identity(uploaded)
 
     matching_scan = (
         upload_identity is not None
@@ -1033,6 +1178,9 @@ def main() -> None:
     dependencies = data.get("dependencies", []) if isinstance(data, dict) else []
     vulnerabilities = data.get("vulnerabilities", []) if isinstance(data, dict) else []
     reachability = data.get("reachability", []) if isinstance(data, dict) else []
+    coverage = data.get("coverage", {}) if isinstance(data, dict) else {}
+    if matching_scan:
+        _display_coverage_notice(coverage, len(vulnerabilities))
 
     if active_section == "overview":
         _render_overview(findings, dependencies, statuses, matching_scan, scan_button)

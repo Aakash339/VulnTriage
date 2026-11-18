@@ -1,6 +1,8 @@
 import unittest
 import csv
 import io
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from collections import Counter
 
 from app import (
@@ -8,6 +10,7 @@ from app import (
     SORT_OPTIONS,
     _filter_findings,
     _finding_summary,
+    _security_analytics,
     _prepare_queue,
     _queue_filter_defaults,
     _risk_analysis_summary,
@@ -17,6 +20,7 @@ from app import (
     _reachability_limitations,
 )
 from reports.report_generator import generate_csv_report
+import app
 
 
 class DashboardFindingTests(unittest.TestCase):
@@ -98,6 +102,16 @@ class DashboardFindingTests(unittest.TestCase):
             "unknown_reachability": 1,
         })
 
+    def test_package_metrics_keep_same_name_separate_across_ecosystems(self):
+        findings = [
+            {"package": "shared", "ecosystem": "PyPI", "severity": "HIGH", "priority": "HIGH", "reachability": "USED", "risk_score": 80},
+            {"package": "shared", "ecosystem": "npm", "severity": "LOW", "priority": "LOW", "reachability": "NOT_FOUND", "risk_score": 30},
+        ]
+        self.assertEqual(_finding_summary(findings)["unique_packages"], 2)
+        analytics = _security_analytics(findings, [])
+        self.assertEqual(len(analytics["package_ranking"]), 2)
+        self.assertEqual({row["ecosystem"] for row in analytics["package_ranking"]}, {"PyPI", "npm"})
+
     def test_36_findings_default_queue_and_empty_filters_show_everything(self):
         findings = make_reported_sample()
         queued = _prepare_queue(findings, set(), set(), "All", SORT_OPTIONS[0])
@@ -134,6 +148,17 @@ class DashboardFindingTests(unittest.TestCase):
         self.assertEqual(len(restored), 36)
         self.assertEqual(len(filtered), 10)
         self.assertEqual(len(csv_rows) - 1, 36)
+
+    def test_reports_download_receives_all_findings_after_queue_filtering(self):
+        findings = make_reported_sample()
+        filtered_queue = _prepare_queue(findings, {"HIGH"}, set(), "All", SORT_OPTIONS[0])
+        self.assertEqual(len(filtered_queue), 10)
+        fake_st = SimpleNamespace(markdown=Mock(), title=Mock(), caption=Mock(), download_button=Mock())
+        with patch.object(app, "st", fake_st):
+            app._render_reports(findings, True, [])
+        downloaded = fake_st.download_button.call_args.kwargs["data"]
+        exported = list(csv.reader(io.StringIO(downloaded.decode("utf-8"))))
+        self.assertEqual(len(exported) - 1, 36)
 
     def test_36_finding_risk_analysis_uses_actual_scores_and_reachability(self):
         summary = _risk_analysis_summary(make_reported_sample())
