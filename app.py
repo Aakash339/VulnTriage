@@ -985,6 +985,202 @@ def _analysis_text(value, default: str = "Not provided") -> str:
     return value.strip() if isinstance(value, str) and value.strip() else default
 
 
+def _compatibility_candidate_versions(assessment: dict) -> list[str]:
+    """Expose only exact candidate strings from a reviewable assessment."""
+    if str(assessment.get("assessment_status", "")).strip().upper() != "REVIEW_REQUIRED":
+        return []
+    candidates = assessment.get("candidate_fixed_versions")
+    if not isinstance(candidates, (list, tuple)):
+        return []
+    return list(dict.fromkeys(
+        value.strip() for value in candidates
+        if isinstance(value, str) and value.strip()
+    ))
+
+
+def _compatibility_identity(package: str, ecosystem: str) -> tuple[str, str]:
+    """Normalize supported identities while retaining unknown ecosystems distinctly."""
+    raw_ecosystem = ecosystem.strip() if isinstance(ecosystem, str) else ""
+    canonical = {"pypi": "PyPI", "npm": "npm", "maven": "Maven"}.get(
+        raw_ecosystem.casefold(), raw_ecosystem,
+    )
+    normalized_package = package.strip() if isinstance(package, str) else ""
+    if canonical == "PyPI":
+        normalized_package = re.sub(r"[-_.]+", "-", normalized_package).casefold()
+    elif canonical != "Maven":
+        normalized_package = normalized_package.casefold()
+    return canonical, normalized_package
+
+
+def _compatibility_run_key(package: str, ecosystem: str, selected_version: str) -> str:
+    identity = _compatibility_identity(package, ecosystem)
+    encoded = "\0".join((*identity, selected_version))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _compatibility_widget_key(package: str, ecosystem: str, control: str) -> str:
+    identity_key = _compatibility_run_key(package, ecosystem, control)
+    scan_identity = st.session_state.get("vulntriage_upload", "")
+    encoded = f"{scan_identity}\0{identity_key}"
+    return f"compatibility-{control}-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:20]}"
+
+
+def _selected_compatibility_test_input(
+    data: dict, package: str, ecosystem: str, selected_version: str,
+) -> dict:
+    """Build the agent's existing explicit-change input after validating provenance."""
+    identity = _compatibility_identity(package, ecosystem)
+    assessments = [
+        record for record in _analysis_records(data.get("compatibility_assessments"))
+        if _compatibility_identity(record.get("package"), record.get("ecosystem")) == identity
+    ]
+    if len(assessments) != 1:
+        raise ValueError("A unique compatibility assessment is required for this package and ecosystem.")
+    assessment = assessments[0]
+    candidates = _compatibility_candidate_versions(assessment)
+    if selected_version not in candidates:
+        raise ValueError("Select a fixed-version candidate from the matching OSV compatibility assessment.")
+    installed_version = assessment.get("installed_version")
+    if not isinstance(installed_version, str) or not installed_version.strip():
+        raise ValueError("The installed version is missing; this change cannot be tested safely.")
+
+    dependencies = []
+    for dependency in _analysis_records(data.get("dependencies")):
+        dependency_record = {
+            "package": dependency.get("name"),
+            "ecosystem": dependency.get("ecosystem"),
+        }
+        if _compatibility_identity(dependency_record.get("package"), dependency_record.get("ecosystem")) == identity:
+            dependencies.append(dependency)
+    matching_versions = [
+        record for record in dependencies
+        if record.get("version") == installed_version
+    ]
+    manifests = list(dict.fromkeys(
+        record.get("source_file") for record in matching_versions
+        if isinstance(record.get("source_file"), str) and record.get("source_file").strip()
+    ))
+    manifest_file = manifests[0] if len(manifests) == 1 else ""
+
+    source_file = ""
+    line_number = 0
+    reference = ""
+    for record in _analysis_records(data.get("code_suggestions")):
+        if _compatibility_identity(record.get("package"), record.get("ecosystem")) != identity:
+            continue
+        line = record.get("line_number")
+        if isinstance(record.get("source_file"), str) and isinstance(line, int) and not isinstance(line, bool) and line > 0:
+            source_file, line_number = record["source_file"], line
+            reference = _analysis_text(record.get("detected_reference"), "")
+            break
+    if not source_file:
+        for impact in _analysis_records(data.get("api_impact_results")):
+            if _compatibility_identity(impact.get("package"), impact.get("ecosystem")) != identity:
+                continue
+            for usage in _analysis_records(impact.get("usages")):
+                line = usage.get("line_number")
+                if isinstance(usage.get("source_file"), str) and isinstance(line, int) and not isinstance(line, bool) and line > 0:
+                    source_file, line_number = usage["source_file"], line
+                    reference = _analysis_text(usage.get("reference"), "")
+                    break
+            if source_file:
+                break
+
+    return {
+        "package": package,
+        "ecosystem": identity[0],
+        "source_file": source_file,
+        "line_number": line_number,
+        "detected_reference": reference,
+        "review_status": "REVIEW_REQUIRED",
+        "proposed_dependency_change": {
+            "package": package,
+            "ecosystem": identity[0],
+            "from_version": installed_version.strip(),
+            "to_version": selected_version,
+            "manifest_file": manifest_file,
+        },
+    }
+
+
+def _compatibility_run_for_selection(data: dict, package: str, ecosystem: str, selected_version: str):
+    runs = data.get("compatibility_check_runs")
+    if not isinstance(runs, dict):
+        return None
+    run = runs.get(_compatibility_run_key(package, ecosystem, selected_version))
+    if not isinstance(run, dict):
+        return None
+    if (
+        _compatibility_identity(run.get("package"), run.get("ecosystem")) != _compatibility_identity(package, ecosystem)
+        or run.get("selected_version") != selected_version
+        or not isinstance(run.get("result"), dict)
+    ):
+        return None
+    return run
+
+
+def _run_selected_compatibility_check(data: dict, uploaded, package: str, ecosystem: str, selected_version: str):
+    """Re-extract the matching ZIP and run the existing isolated checker."""
+    suggestion = _selected_compatibility_test_input(data, package, ecosystem, selected_version)
+    expected_identity = st.session_state.get("vulntriage_upload")
+    if uploaded is None or not expected_identity or _upload_identity(uploaded) != expected_identity:
+        raise ValueError("The ZIP for this scan is unavailable or no longer matches the completed scan.")
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="vulntriage-selected-check-") as temporary_dir:
+            project_root = _extract_project_zip(uploaded.getvalue(), Path(temporary_dir))
+            try:
+                results = run_compatibility_tests(
+                    str(project_root),
+                    _analysis_records(data.get("compatibility_assessments")),
+                    [suggestion],
+                )
+            except Exception as error:
+                results = [{
+                    "package": package,
+                    "ecosystem": ecosystem,
+                    "status": "FAILED",
+                    "test_command": None,
+                    "tested_dependency_changes": [],
+                    "stdout": "",
+                    "stderr": "",
+                    "exit_code": None,
+                    "reason": f"The compatibility test agent failed ({error.__class__.__name__}).",
+                    "limitations": "No reliable compatibility conclusion was produced.",
+                }]
+    except (OSError, ArchiveValidationError, zipfile.BadZipFile) as error:
+        results = [{
+            "package": package,
+            "ecosystem": ecosystem,
+            "status": "NOT_RUN",
+            "test_command": None,
+            "tested_dependency_changes": [],
+            "stdout": "",
+            "stderr": "",
+            "exit_code": None,
+            "reason": f"The project ZIP could not be safely prepared for checking ({error.__class__.__name__}).",
+            "limitations": "No compatibility check was performed.",
+        }]
+    result = results[0] if results else {
+        "package": package, "ecosystem": ecosystem, "status": "NOT_RUN", "test_command": None,
+        "tested_dependency_changes": [], "stdout": "", "stderr": "", "exit_code": None,
+        "reason": "The compatibility test agent returned no result.",
+        "limitations": "No compatibility check was performed.",
+    }
+    run = {
+        "package": package,
+        "ecosystem": _compatibility_identity(package, ecosystem)[0],
+        "selected_version": selected_version,
+        "result": result,
+    }
+    updated_data = dict(data)
+    runs = data.get("compatibility_check_runs")
+    updated_runs = dict(runs) if isinstance(runs, dict) else {}
+    updated_runs[_compatibility_run_key(package, ecosystem, selected_version)] = run
+    updated_data["compatibility_check_runs"] = updated_runs
+    return updated_data
+
+
 def _record_review_decision(scan_data: dict, proposal_id: str, decision: str, reviewer: str, comment: str):
     """Return a copied scan-data mapping with a validated decision persisted."""
     proposals = scan_data.get("review_proposals", [])
@@ -1038,6 +1234,67 @@ def _render_remediation_compatibility(data: dict | None) -> None:
             else:
                 st.write("Evidence used: None recorded")
             st.write(_analysis_text(record.get("explanation")))
+            candidates = _compatibility_candidate_versions(record)
+            if candidates:
+                selected_version = st.selectbox(
+                    "Select an OSV fixed-version candidate to check",
+                    options=candidates,
+                    index=None,
+                    placeholder="Choose a version; no version is selected automatically",
+                    key=_compatibility_widget_key(package, ecosystem, "selector"),
+                )
+                run_check = st.button(
+                    "Run isolated compatibility check",
+                    key=_compatibility_widget_key(package, ecosystem, "action"),
+                    disabled=selected_version is None,
+                )
+                if run_check and selected_version is not None:
+                    try:
+                        updated_data = _run_selected_compatibility_check(
+                            data, st.session_state.get("soc_uploaded_project"),
+                            package, ecosystem, selected_version,
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    except Exception as error:
+                        st.error(f"Compatibility check could not be completed ({error.__class__.__name__}).")
+                    else:
+                        st.session_state["soc_scan_data"] = updated_data
+                        data = updated_data
+                        st.success(f"Compatibility check finished for {package} at proposed version {selected_version}.")
+                if selected_version:
+                    st.write(f"Selected proposed version: {selected_version}")
+                    selected_run = _compatibility_run_for_selection(data, package, ecosystem, selected_version)
+                    if selected_run is None:
+                        st.caption("No check result exists for this selected version yet. Choosing a version does not apply it.")
+                    else:
+                        check = selected_run["result"]
+                        st.write(f"Check result for {selected_version}: {_analysis_text(check.get('status'), 'NOT_RUN')}")
+                        changes = _analysis_records(check.get("tested_dependency_changes"))
+                        if changes:
+                            for change in changes:
+                                st.write(
+                                    f"Tested change: {_analysis_text(change.get('package'), package)} "
+                                    f"({_analysis_text(change.get('ecosystem'), ecosystem)}) "
+                                    f"{_analysis_text(change.get('from_version'), 'unknown')} → "
+                                    f"{_analysis_text(change.get('to_version'), 'unknown')}"
+                                )
+                        else:
+                            st.write(f"Tested dependency change: {package} → {selected_version} (not applied; check was not run)")
+                        command = check.get("test_command")
+                        st.write("Command/check: " + (
+                            " ".join(str(part) for part in command)
+                            if isinstance(command, (list, tuple)) else _analysis_text(command, "Not run")
+                        ))
+                        st.write(_analysis_text(check.get("reason")))
+                        for output_key in ("stdout", "stderr"):
+                            output = check.get(output_key)
+                            if isinstance(output, str) and output.strip():
+                                st.write(f"{output_key.upper()} summary:")
+                                st.code(output[:4000], language=None)
+                        st.caption(_analysis_text(check.get("limitations"), "A static check cannot establish runtime compatibility or security."))
+            else:
+                st.caption("No selectable fixed-version candidates are available for this assessment.")
 
     st.subheader("API usage impact")
     _render_optional_stage_status(data, "api_impact", "API impact analysis")
@@ -1099,7 +1356,7 @@ def _render_remediation_compatibility(data: dict | None) -> None:
             st.write(_analysis_text(record.get("guidance") or record.get("explanation")))
             st.write(f"Confidence: {_analysis_text(record.get('confidence'), 'LOW')} · Review status: {_analysis_text(record.get('review_status'), 'NO_SAFE_SUGGESTION')}")
 
-    st.subheader("Compatibility checks")
+    st.subheader("Initial compatibility checks")
     _render_optional_stage_status(data, "compatibility_tests", "Compatibility checks")
     test_results = _analysis_records(data.get("compatibility_test_results"))
     if not test_results:

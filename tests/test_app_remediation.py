@@ -31,6 +31,7 @@ class RemediationDashboardTests(unittest.TestCase):
             success=capture("success"), code=capture("code"),
             expander=capture_expander,
             columns=lambda count: [nullcontext() for _ in range(count)],
+            selectbox=lambda _label, options, **_kwargs: None,
             text_input=lambda label, key: self.text_values.get(key, ""),
             button=lambda label, key, **_kwargs: self.button_results.get(key, False),
             session_state=self.state,
