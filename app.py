@@ -16,6 +16,11 @@ from pathlib import Path, PurePosixPath
 
 import streamlit as st
 
+from agents.api_impact_agent import analyze_api_impact
+from agents.approval_agent import prepare_review_proposals
+from agents.code_suggestion_agent import generate_code_suggestions
+from agents.compatibility_agent import analyze_compatibility
+from agents.compatibility_test_agent import run_compatibility_tests
 from orchestrator import run_vulntriage
 from reports.report_generator import generate_csv_report
 
@@ -1017,7 +1022,19 @@ def _navigation_section(value: str) -> str:
 
 def _scan_with_progress(uploaded, upload_identity) -> None:
     statuses = {stage: "pending" for stage, _ in _PIPELINE_STAGES}
-    data = {"dependencies": [], "vulnerabilities": [], "reachability": [], "findings": [], "coverage": {}}
+    optional_stages = (
+        ("compatibility", "Compatibility Analysis", "compatibility_assessments", analyze_compatibility),
+        ("api_impact", "API Usage Impact", "api_impact_results", analyze_api_impact),
+        ("code_suggestions", "Code Suggestions", "code_suggestions", generate_code_suggestions),
+        ("compatibility_tests", "Compatibility Checks", "compatibility_test_results", run_compatibility_tests),
+        ("approvals", "Review Proposals", "review_proposals", prepare_review_proposals),
+    )
+    data = {
+        "dependencies": [], "vulnerabilities": [], "reachability": [], "findings": [], "coverage": {},
+        "compatibility_assessments": [], "api_impact_results": [], "code_suggestions": [],
+        "compatibility_test_results": [], "review_proposals": [],
+        "analysis_status": {name: {"status": "pending"} for name, _label, _key, _agent in optional_stages},
+    }
     coverage: dict = {}
     current_stage = "extraction"
     st.session_state["soc_scan_status"] = "scanning"
@@ -1042,10 +1059,10 @@ def _scan_with_progress(uploaded, upload_identity) -> None:
                 redraw()
                 project_root = _extract_project_zip(archive_bytes, Path(temporary_dir))
                 statuses[current_stage] = "completed"
-                progress_bar.progress(20, text="Project extraction complete")
+                progress_bar.progress(10, text="Project extraction complete")
                 redraw()
 
-                stage_progress = {"dependencies": 40, "osv": 60, "reachability": 80, "risk": 100}
+                stage_progress = {"dependencies": 20, "osv": 30, "reachability": 40, "risk": 60}
                 stage_names = dict(_PIPELINE_STAGES)
 
                 def on_progress(event: dict) -> None:
@@ -1057,7 +1074,8 @@ def _scan_with_progress(uploaded, upload_identity) -> None:
                     current_stage = stage
                     if state == "started":
                         statuses[stage] = "running"
-                        progress_bar.progress((stage_progress[stage] - 20), text=f"{stage_names[stage]} in progress")
+                        previous_progress = 10 if stage == "dependencies" else stage_progress[stage] - 10
+                        progress_bar.progress(previous_progress, text=f"{stage_names[stage]} in progress")
                     else:
                         statuses[stage] = "completed"
                         data_key = {"dependencies": "dependencies", "osv": "vulnerabilities",
@@ -1070,6 +1088,42 @@ def _scan_with_progress(uploaded, upload_identity) -> None:
                     str(project_root), progress_callback=on_progress, coverage=coverage,
                 )
                 data["coverage"] = coverage
+
+                # Run source-dependent analysis before TemporaryDirectory cleanup.
+                # Each stage is optional: preserve the existing scan result if one fails.
+                for index, (stage, label, result_key, agent) in enumerate(optional_stages):
+                    analysis_status = data["analysis_status"][stage]
+                    analysis_status["status"] = "running"
+                    progress_value = 60 + (index * 8)
+                    progress_bar.progress(progress_value, text=f"{label} in progress")
+                    try:
+                        if stage == "compatibility":
+                            result = agent(data["dependencies"], data["vulnerabilities"], data["reachability"])
+                        elif stage == "api_impact":
+                            result = agent(
+                                str(project_root), data["dependencies"], data["compatibility_assessments"],
+                            )
+                        elif stage == "code_suggestions":
+                            result = agent(
+                                str(project_root), data["api_impact_results"], data["compatibility_assessments"],
+                            )
+                        elif stage == "compatibility_tests":
+                            result = agent(
+                                str(project_root), data["compatibility_assessments"], data["code_suggestions"],
+                            )
+                        else:
+                            result = agent(
+                                data["compatibility_assessments"], data["api_impact_results"],
+                                data["code_suggestions"], data["compatibility_test_results"],
+                            )
+                        data[result_key] = result
+                        analysis_status["status"] = "completed"
+                    except Exception as error:
+                        analysis_status["status"] = "failed"
+                        detail = str(error).strip() or error.__class__.__name__
+                        analysis_status["error"] = f"{error.__class__.__name__}: {detail[:240]}"
+                    stage_message = f"{label} complete" if analysis_status["status"] == "completed" else f"{label} failed"
+                    progress_bar.progress(68 + (index * 8), text=stage_message)
             st.session_state["vulntriage_findings"] = findings
             st.session_state["vulntriage_upload"] = upload_identity
             st.session_state["soc_scan_data"] = data
@@ -1078,7 +1132,15 @@ def _scan_with_progress(uploaded, upload_identity) -> None:
             for key, value in _queue_filter_defaults(findings).items():
                 st.session_state[key] = value
             st.session_state.pop("vulntriage_error", None)
-            progress_bar.progress(100, text="All analysis stages complete")
+            optional_failures = [
+                name for name, result in data["analysis_status"].items()
+                if result.get("status") == "failed"
+            ]
+            completion_message = (
+                "Vulnerability scan complete; optional analysis had errors"
+                if optional_failures else "All analysis stages complete"
+            )
+            progress_bar.progress(100, text=completion_message)
         except Exception as error:
             statuses[current_stage] = "failed"
             st.session_state["soc_pipeline_statuses"] = statuses
