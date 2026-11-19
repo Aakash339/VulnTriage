@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 import streamlit as st
 
 from agents.api_impact_agent import analyze_api_impact
-from agents.approval_agent import prepare_review_proposals
+from agents.approval_agent import prepare_review_proposals, submit_review_decision
 from agents.code_suggestion_agent import generate_code_suggestions
 from agents.compatibility_agent import analyze_compatibility
 from agents.compatibility_test_agent import run_compatibility_tests
@@ -974,6 +974,225 @@ def _render_analytics(findings: list, vulnerabilities: list, scan_completed: boo
     st.caption("Ecosystem and fixed-version analytics are counted from OSV vulnerability records. Import detection does not prove exploitability; NOT_FOUND does not establish safety.")
 
 
+def _analysis_records(value) -> list[dict]:
+    """Return well-formed optional-agent rows without trusting cached data."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [record for record in value if isinstance(record, dict)]
+
+
+def _analysis_text(value, default: str = "Not provided") -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _record_review_decision(scan_data: dict, proposal_id: str, decision: str, reviewer: str, comment: str):
+    """Return a copied scan-data mapping with a validated decision persisted."""
+    proposals = scan_data.get("review_proposals", [])
+    updated_proposals = submit_review_decision(proposals, proposal_id, decision, reviewer, comment)
+    updated_data = dict(scan_data)
+    updated_data["review_proposals"] = updated_proposals
+    return updated_data
+
+
+def _render_optional_stage_status(data: dict, stage: str, label: str) -> None:
+    statuses = data.get("analysis_status")
+    stage_status = statuses.get(stage) if isinstance(statuses, dict) else None
+    if not isinstance(stage_status, dict):
+        st.info(f"{label} results are unavailable for this scan (for example, it may be an older saved session).")
+    elif stage_status.get("status") == "failed":
+        st.warning(f"{label} did not complete: {_analysis_text(stage_status.get('error'), 'No error detail was recorded.')}")
+
+
+def _render_remediation_compatibility(data: dict | None) -> None:
+    """Show optional upgrade-analysis and human-review records from this scan."""
+    st.markdown('<div class="soc-section-kicker">04 / Remediation review</div>', unsafe_allow_html=True)
+    st.title("Remediation & Compatibility")
+    st.caption(
+        "These are review signals, not compatibility guarantees. Static API references identify potential impact; "
+        "syntax checks do not prove runtime compatibility or security. Human decisions are kept in this Streamlit session only."
+    )
+    if not isinstance(data, dict) or not data:
+        st.info("Compatibility and remediation review results appear after a scan completes.")
+        return
+
+    st.subheader("Compatibility assessments")
+    _render_optional_stage_status(data, "compatibility", "Compatibility analysis")
+    assessments = _analysis_records(data.get("compatibility_assessments"))
+    if not assessments:
+        st.caption("No compatibility assessments were returned.")
+    for index, record in enumerate(assessments):
+        package = _analysis_text(record.get("package"), "Unknown package")
+        ecosystem = _analysis_text(record.get("ecosystem"), "Unknown ecosystem")
+        with st.expander(f"{index + 1}. {package} · {ecosystem} · {_analysis_text(record.get('assessment_status'), 'NOT_ASSESSED')}", expanded=False):
+            st.write(f"Installed version: {_analysis_text(record.get('installed_version'), 'Unknown')}")
+            candidates = record.get("candidate_fixed_versions")
+            if isinstance(candidates, (list, tuple)) and candidates:
+                st.write("OSV fixed-version candidates: " + ", ".join(str(value) for value in candidates))
+            else:
+                st.write("OSV fixed-version candidates: None supplied")
+            evidence = record.get("evidence_used")
+            if isinstance(evidence, (list, tuple)) and evidence:
+                st.write("Evidence used:")
+                for item in evidence:
+                    st.markdown(f"- {item}")
+            else:
+                st.write("Evidence used: None recorded")
+            st.write(_analysis_text(record.get("explanation")))
+
+    st.subheader("API usage impact")
+    _render_optional_stage_status(data, "api_impact", "API impact analysis")
+    impacts = _analysis_records(data.get("api_impact_results"))
+    if not impacts:
+        st.caption("No API impact records were returned.")
+    for index, record in enumerate(impacts):
+        package = _analysis_text(record.get("package"), "Unknown package")
+        ecosystem = _analysis_text(record.get("ecosystem"), "Unknown ecosystem")
+        status = _analysis_text(record.get("status"), "NOT_ASSESSED")
+        with st.expander(f"{index + 1}. {package} · {ecosystem} · {status}", expanded=False):
+            usages = _analysis_records(record.get("usages"))
+            if usages:
+                for usage in usages:
+                    location = _analysis_text(usage.get("source_file"), "Unknown source")
+                    line = usage.get("line_number")
+                    if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+                        location += f":{line}"
+                    st.write(f"{location} · {_analysis_text(usage.get('kind'), 'reference')}")
+                    st.code(_analysis_text(usage.get("statement") or usage.get("reference")), language=None)
+            else:
+                st.write("No identifiable source import or API reference was returned.")
+            evidence = record.get("evidence")
+            if isinstance(evidence, (list, tuple)):
+                for item in evidence:
+                    st.markdown(f"- {item}")
+            st.write(_analysis_text(record.get("explanation")))
+            st.caption("Potential impact is unverified; source references do not establish that an upgrade breaks or preserves behavior.")
+
+    st.subheader("Code modification suggestions")
+    _render_optional_stage_status(data, "code_suggestions", "Code suggestion analysis")
+    suggestions = _analysis_records(data.get("code_suggestions"))
+    if not suggestions:
+        st.caption("No source-specific code suggestions were returned.")
+    for index, record in enumerate(suggestions):
+        package = _analysis_text(record.get("package"), "Unknown package")
+        ecosystem = _analysis_text(record.get("ecosystem"), "Unknown ecosystem")
+        location = _analysis_text(record.get("source_file"), "Unknown source")
+        line = record.get("line_number")
+        if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+            location += f":{line}"
+        with st.expander(f"{index + 1}. {package} · {ecosystem} · {location}", expanded=False):
+            st.write(f"Detected reference: {_analysis_text(record.get('detected_reference'))}")
+            current = record.get("current_code_snippet")
+            if isinstance(current, str) and current.strip():
+                st.write("Current code evidence:")
+                st.code(current, language=None)
+            reliable_snippet = (
+                isinstance(record.get("proposed_code_snippet"), str)
+                and bool(record["proposed_code_snippet"].strip())
+                and str(record.get("guidance_type", "")).upper() == "EVIDENCE_BACKED"
+                and bool(record.get("proposed_code_evidence"))
+            )
+            if reliable_snippet:
+                st.write("Evidence-backed proposed snippet:")
+                st.code(record["proposed_code_snippet"], language=None)
+            else:
+                st.info("No safe evidence-backed replacement snippet is available. Any guidance is illustrative and requires maintainer documentation and developer review.")
+            st.write(_analysis_text(record.get("guidance") or record.get("explanation")))
+            st.write(f"Confidence: {_analysis_text(record.get('confidence'), 'LOW')} · Review status: {_analysis_text(record.get('review_status'), 'NO_SAFE_SUGGESTION')}")
+
+    st.subheader("Compatibility checks")
+    _render_optional_stage_status(data, "compatibility_tests", "Compatibility checks")
+    test_results = _analysis_records(data.get("compatibility_test_results"))
+    if not test_results:
+        st.caption("No compatibility check records were returned.")
+    for index, record in enumerate(test_results):
+        package = _analysis_text(record.get("package"), "No package change")
+        ecosystem = _analysis_text(record.get("ecosystem"), "Unknown ecosystem")
+        status = _analysis_text(record.get("status"), "NOT_RUN")
+        with st.expander(f"{index + 1}. {package} · {ecosystem} · {status}", expanded=False):
+            changes = _analysis_records(record.get("tested_dependency_changes"))
+            if changes:
+                for change in changes:
+                    st.write(
+                        f"Tested change: {_analysis_text(change.get('package'), package)} "
+                        f"({_analysis_text(change.get('ecosystem'), ecosystem)}) "
+                        f"{_analysis_text(change.get('from_version'), 'unknown')} → "
+                        f"{_analysis_text(change.get('to_version'), 'unknown')}"
+                    )
+            else:
+                st.write("Tested dependency change: None")
+            command = record.get("test_command")
+            st.write("Command: " + (" ".join(str(part) for part in command) if isinstance(command, (list, tuple)) else _analysis_text(command, "Not run")))
+            st.write(_analysis_text(record.get("reason")))
+            for output_key in ("stdout", "stderr"):
+                output = record.get(output_key)
+                if isinstance(output, str) and output.strip():
+                    st.write(f"{output_key.upper()} summary:")
+                    st.code(output[:4000], language=None)
+            limitations = record.get("limitations")
+            if isinstance(limitations, (list, tuple)):
+                for limitation in limitations:
+                    st.caption(str(limitation))
+            st.caption("A PASSED static syntax check is not proof of API compatibility, runtime behavior, or security.")
+
+    st.subheader("Developer approval")
+    _render_optional_stage_status(data, "approvals", "Review proposal preparation")
+    proposals = _analysis_records(data.get("review_proposals"))
+    if not proposals:
+        st.caption("No review proposals were returned.")
+    else:
+        st.caption("Review decisions are stored in this Streamlit session and are not durable audit records.")
+    for index, proposal in enumerate(proposals):
+        proposal_id = _analysis_text(proposal.get("proposal_id"), f"missing-id-{index}")
+        package = _analysis_text(proposal.get("package"), "Unknown package")
+        ecosystem = _analysis_text(proposal.get("ecosystem"), "Unknown ecosystem")
+        review_status = _analysis_text(proposal.get("review_status") or proposal.get("decision"), "PENDING").upper()
+        with st.expander(f"{index + 1}. {package} · {ecosystem} · {review_status}", expanded=False):
+            st.write(f"Proposal ID: {proposal_id}")
+            st.write(f"Installed version: {_analysis_text(proposal.get('installed_version'), 'Unknown')}")
+            st.write(f"Proposed version: {_analysis_text(proposal.get('proposed_version'), 'None selected')}")
+            proposal_candidates = proposal.get("candidate_fixed_versions")
+            st.write("OSV fixed-version candidates: " + (
+                ", ".join(str(value) for value in proposal_candidates)
+                if isinstance(proposal_candidates, (list, tuple)) and proposal_candidates else "None supplied"
+            ))
+            st.write(f"Confidence: {_analysis_text(proposal.get('confidence'), 'LOW')} · Manifest: {_analysis_text(proposal.get('manifest_file'), 'Not selected')}")
+            st.write(f"Compatibility test: {_analysis_text(proposal.get('compatibility_test_status'), 'NOT_RUN')} · {_analysis_text(proposal.get('compatibility_test_summary'))}")
+            st.write(_analysis_text(proposal.get("explanation")))
+            source_evidence = _analysis_records(proposal.get("source_evidence"))
+            for evidence in source_evidence:
+                source_location = _analysis_text(evidence.get("source_file"), "Unknown source")
+                line = evidence.get("line_number")
+                if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+                    source_location += f":{line}"
+                st.write(f"Evidence: {source_location} · {_analysis_text(evidence.get('reference'))}")
+            snippet = proposal.get("proposed_code_snippet")
+            if isinstance(snippet, str) and snippet.strip():
+                st.write("Evidence-backed proposed code:")
+                st.code(snippet, language=None)
+            st.write(f"Reviewer: {_analysis_text(proposal.get('reviewer_identity'), 'Not reviewed')} · Decision time: {_analysis_text(proposal.get('decision_timestamp'), 'Not decided')}")
+            if proposal.get("review_comment"):
+                st.write(f"Review comment: {proposal['review_comment']}")
+            if review_status == "PENDING":
+                reviewer = st.text_input("Reviewer identity (required)", key=f"reviewer-{proposal_id}")
+                comment = st.text_input("Review comment (optional)", key=f"review-comment-{proposal_id}")
+                approve_col, reject_col = st.columns(2)
+                with approve_col:
+                    approve = st.button("Approve proposal", key=f"approve-{proposal_id}", type="primary")
+                with reject_col:
+                    reject = st.button("Reject proposal", key=f"reject-{proposal_id}")
+                selected_decision = "APPROVED" if approve else "REJECTED" if reject else None
+                if selected_decision:
+                    try:
+                        updated_data = _record_review_decision(data, proposal_id, selected_decision, reviewer, comment)
+                    except (KeyError, ValueError) as error:
+                        st.error(str(error))
+                    else:
+                        st.session_state["soc_scan_data"] = updated_data
+                        st.success(f"Proposal {selected_decision.lower()} for {package}.")
+            else:
+                st.caption("This proposal has a final decision. The decision cannot be overwritten in this MVP.")
+
+
 def _render_distribution(counts: dict[str, int], order: tuple[str, ...]) -> None:
     colors = {"CRITICAL": "#ff5265", "HIGH": "#ff9a45", "MEDIUM": "#f4d35e", "LOW": "#45d483", "UNKNOWN": "#8b98a7"}
     peak = max(counts.values(), default=0) or 1
@@ -1253,6 +1472,7 @@ def main() -> None:
         _render_inventory(dependencies, matching_scan)
     elif active_section == "intelligence":
         _render_analytics(findings, vulnerabilities, matching_scan)
+        _render_remediation_compatibility(data if matching_scan else {})
     elif active_section == "reports":
         _render_reports(findings if matching_scan else [], matching_scan, reachability if matching_scan else [])
 
